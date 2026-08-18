@@ -1,0 +1,3470 @@
+
+
+============================================================
+FILE: gate_engine.py
+============================================================
+#!/usr/bin/env python3
+"""Run the gate against replay data.
+
+    python gate_engine.py                 # full scenario, ends ARMED and takes the trade
+    python gate_engine.py --no-orderflow  # same bars, no footprint: never arms
+    python gate_engine.py --thin-volume   # participation below the MNQ floor: halted
+    python gate_engine.py --instrument ES # threshold not calibrated: halted, not inherited
+    python gate_engine.py --json          # print the API payload instead of the screen
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+from tradinggate import (
+    AUCTION_ABSORPTION_V1,
+    Direction,
+    EventLogger,
+    GammaRegime,
+    GateEngine,
+    GateState,
+    JsonStore,
+    PreMarketPlan,
+    ReplayProvider,
+    SessionState,
+    Settings,
+    StaticOptionsProvider,
+    StrippedProvider,
+    Structure,
+    ViolationKind,
+    behaviour,
+    explain,
+    gate_payload,
+    get_profile,
+    render,
+)
+from tradinggate.marketdata import GexSnapshot
+from tradinggate.replay_builder import (
+    CONFIRMING_BAR,
+    SESSION_OPEN_BAR,
+    mnq_long_scenario,
+    session_open_time,
+    thin_participation_tail,
+    write_jsonl,
+)
+
+DATA = Path(__file__).parent / "data"
+REPLAY = DATA / "replay" / "mnq_long_absorption.jsonl"
+
+
+def build_plan(instrument: str, session_date: str, at: datetime) -> PreMarketPlan:
+    plan = PreMarketPlan(
+        instrument=instrument,
+        session_date=session_date,
+        direction=Direction.LONG,
+        htf_structure=Structure.VALUE_UP,
+        gamma_regime=GammaRegime.NEGATIVE_GAMMA,
+        call_wall=20200.0,
+        put_wall=19800.0,
+        gamma_flip=20000.0,
+        scenarios=[
+            "Pullback into discount below value; long on a second seller failure.",
+            "Acceptance back inside value without a failure: stand aside.",
+        ],
+        invalidation_note="Close through the 0.886 of the impulse leg.",
+        trail_plan="Trail behind each 5m close whose aggression produced progression.",
+    )
+    plan.lock(at)
+    return plan
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Trading execution gate")
+    ap.add_argument("--instrument", default=None)
+    ap.add_argument("--replay", default=None, help="path to a JSONL bar file")
+    ap.add_argument("--no-orderflow", action="store_true",
+                    help="strip footprint data to prove the gate will not arm on OHLC")
+    ap.add_argument("--thin-volume", action="store_true",
+                    help="drop the confirming bar below the participation floor")
+    ap.add_argument("--json", action="store_true", help="print the API payload")
+    ap.add_argument("--quiet", action="store_true", help="only the final screen")
+    args = ap.parse_args()
+
+    settings = Settings.from_env()
+    symbol = (args.instrument or settings.default_instrument).upper()
+    profile = get_profile(symbol)
+
+    bars = mnq_long_scenario()
+    if args.thin_volume:
+        bars = thin_participation_tail(bars, CONFIRMING_BAR)
+    if not args.replay:
+        write_jsonl(bars, REPLAY)
+        provider = ReplayProvider.from_bars(bars, symbol, profile.confirmation_timeframe)
+    else:
+        provider = ReplayProvider(args.replay, symbol, profile.confirmation_timeframe)
+        bars = provider._all
+    if args.no_orderflow:
+        provider = StrippedProvider(provider)
+
+    open_time = session_open_time(bars)
+    session_date = open_time.date().isoformat()
+    session = SessionState(
+        instrument=symbol,
+        session_date=session_date,
+        open_time=open_time,
+        limit_minutes=profile.session_limit_minutes,
+        max_consecutive_losses=profile.max_consecutive_losses,
+    )
+    plan = build_plan(symbol, session_date, open_time)
+    logger = EventLogger(sink=DATA / "events" / f"{symbol}_{session_date}.jsonl",
+                         echo=not args.quiet)
+
+    engine = GateEngine(
+        instrument=profile,
+        plan=plan,
+        session=session,
+        data=provider,
+        strategy=AUCTION_ABSORPTION_V1,
+        options=StaticOptionsProvider(GexSnapshot(
+            regime=GammaRegime.NEGATIVE_GAMMA, call_wall=20200.0,
+            put_wall=19800.0, gamma_flip=20000.0, source="manual-premarket")),
+        logger=logger,
+    )
+
+    print(f"\nmode {settings.trading_mode.value}   instrument {symbol}   "
+          f"strategy {AUCTION_ABSORPTION_V1.key}")
+    print(f"participation floor: "
+          f"{profile.minimum_volume if profile.volume_calibrated else 'NOT CALIBRATED'}")
+    print(f"replay bars: {len(bars)}   NY open at bar {SESSION_OPEN_BAR}\n")
+
+    inner = provider.inner if isinstance(provider, StrippedProvider) else provider
+    snapshot = None
+    trade = None
+    entry_snapshot = None
+
+    while not inner.exhausted:
+        inner.advance()
+        snapshot = engine.evaluate()
+        if snapshot.gate_state is GateState.ARMED and trade is None:
+            entry_snapshot = snapshot
+            trade = engine.enter(snapshot, size=1)
+
+    if snapshot is None:
+        print("no bars")
+        return 1
+
+    if entry_snapshot is not None:
+        print("\n=== the moment the gate armed ===")
+        print(render(entry_snapshot))
+        print()
+        print(explain(entry_snapshot))
+
+    print("\n=== final bar ===")
+    print(render(snapshot))
+    print()
+    print(explain(snapshot))
+
+    if trade is not None:
+        # Managed exit: the follow-through bar reclaims value, so the trade is
+        # carried to the swing target rather than cut at the checkpoint.
+        exit_price = bars[-1].close
+        grade = engine.close(trade, exit_price)
+        print("\n--- trade result ---")
+        print(grade.render())
+        print("\nreasons:")
+        for reason in grade.reasons:
+            print(f"  - {reason}")
+    else:
+        print("\nNo trade taken. That is a result, not a failure - "
+              f"{session.rejected_setups} setup(s) rejected, "
+              f"{session.gate_attempts} evaluations.")
+
+    print("\n--- session health ---")
+    print(json.dumps(session.health(), indent=2, default=str))
+
+    if args.json:
+        print("\n--- api payload ---")
+        print(json.dumps(gate_payload(snapshot, session), indent=2, default=str))
+
+    store = JsonStore(DATA)
+    key = store.save_session(session)
+    for t in session.trades:
+        store.save_trade(key, t)
+    store.save_events(key, logger.events)
+
+    print("\n--- behaviour analytics ---")
+    for row in behaviour.analyse(session.trades):
+        print(" ", json.dumps(row, default=str))
+    print(f"\nsaved to {DATA / 'sessions' / (key + '.json')}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+============================================================
+FILE: tradinggate\gate.py
+============================================================
+"""The gate engine.
+
+Sequence per evaluation:
+    build context -> evaluate hard halts -> evaluate every condition
+    -> roll conditions up into stages -> decide the gate state.
+
+Halts are checked first and win outright. Stages are evaluated even when a
+prerequisite has not passed, so the UI can show live counts, but a stage whose
+prerequisite is unmet is reported as LOCKED and cannot contribute to ARMED.
+"""
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Dict, List, Optional, Sequence
+
+from . import analytics as an
+from .conditions import ConditionResult, EvaluationContext, derive_structure
+from .confirmation import ConfirmationEvidence, ConfirmationTracker
+from .enums import (
+    Capability,
+    ConditionStatus,
+    Direction,
+    GateState,
+    ManagementAction,
+    Stage,
+    STAGE_ORDER,
+    StageStatus,
+    Structure,
+    ViolationKind,
+)
+from .events import EventLogger
+from .grading import GradeResult, grade_trade
+from .halts import Halt, evaluate_halts, halt_state
+from .instruments import InstrumentProfile
+from .marketdata import (
+    MarketDataProvider,
+    NewsProvider,
+    NullNewsProvider,
+    NullOptionsProvider,
+    OptionsDataProvider,
+)
+from .plan import PreMarketPlan
+from .session import SessionState, TradeRecord
+from .strategies import AUCTION_ABSORPTION_V1, StrategyTemplate, satisfies
+
+NEWS_WINDOW_MINUTES = 10
+
+
+@dataclass
+class StageResult:
+    stage: Stage
+    status: StageStatus
+    results: List[ConditionResult]
+    blocked_by: Optional[Stage] = None
+
+    @property
+    def passed(self) -> int:
+        return sum(1 for r in self.results if r.satisfied)
+
+    @property
+    def required(self) -> int:
+        return len(self.results)
+
+    def waiting_for(self) -> List[str]:
+        return [r.code for r in self.results if r.status is ConditionStatus.WAITING]
+
+    def failed(self) -> List[str]:
+        return [r.code for r in self.results if r.status is ConditionStatus.FAILED]
+
+    def unverified(self) -> List[str]:
+        """Conditions counted as satisfied without ever being checked."""
+        return [r.code for r in self.results
+                if r.status is ConditionStatus.UNKNOWN and r.satisfied]
+
+    def blocking_unknown(self) -> List[str]:
+        return [r.code for r in self.results
+                if r.status is ConditionStatus.UNKNOWN and not r.satisfied]
+
+    def to_dict(self) -> Dict:
+        return {
+            "status": self.status.value,
+            "passed": self.passed,
+            "required": self.required,
+            "blocked_by": self.blocked_by.value if self.blocked_by else None,
+            "waiting_for": self.waiting_for(),
+            "failed": self.failed(),
+            "unknown": self.blocking_unknown(),
+            "unverified": self.unverified(),
+            "conditions": [r.to_dict() for r in self.results],
+        }
+
+
+@dataclass
+class GateSnapshot:
+    ts: datetime
+    instrument: str
+    gate_state: GateState
+    stages: Dict[Stage, StageResult]
+    halts: List[Halt] = field(default_factory=list)
+    context: Optional[EvaluationContext] = None
+    session_health: Dict = field(default_factory=dict)
+
+    @property
+    def armed(self) -> bool:
+        return self.gate_state is GateState.ARMED
+
+    @property
+    def hard_halt(self) -> bool:
+        return bool(self.halts)
+
+    def waiting_for(self) -> List[str]:
+        out: List[str] = []
+        for stage in STAGE_ORDER:
+            sr = self.stages[stage]
+            for r in sr.results:
+                if r.status is ConditionStatus.WAITING:
+                    out.append(f"{r.code} {r.label}")
+        return out
+
+    def conditions_passed(self) -> int:
+        return sum(s.passed for s in self.stages.values())
+
+    def conditions_required(self) -> int:
+        return sum(s.required for s in self.stages.values())
+
+    def unverified(self) -> List[str]:
+        """Codes that were UNKNOWN but did not block - the honesty ledger."""
+        out: List[str] = []
+        for stage in STAGE_ORDER:
+            out.extend(self.stages[stage].unverified())
+        return out
+
+    def unsatisfied(self) -> List[str]:
+        out: List[str] = []
+        for stage in STAGE_ORDER:
+            out.extend(r.code for r in self.stages[stage].results if not r.satisfied)
+        return out
+
+
+class GateEngine:
+    def __init__(
+        self,
+        instrument: InstrumentProfile,
+        plan: PreMarketPlan,
+        session: SessionState,
+        data: MarketDataProvider,
+        strategy: StrategyTemplate = AUCTION_ABSORPTION_V1,
+        options: Optional[OptionsDataProvider] = None,
+        news: Optional[NewsProvider] = None,
+        logger: Optional[EventLogger] = None,
+    ):
+        self.instrument = instrument
+        self.plan = plan
+        self.session = session
+        self.data = data
+        self.strategy = strategy
+        self.options = options or NullOptionsProvider()
+        self.news = news or NullNewsProvider()
+        self.log = logger or EventLogger()
+
+        self._tracker: Optional[ConfirmationTracker] = None
+        self._fed = 0
+        self._evidence = ConfirmationEvidence()
+        self._open_trade: Optional[TradeRecord] = None
+        self._last_state: Optional[GateState] = None
+
+    # -- derived context ---------------------------------------------------
+    def _build_context(self, now: Optional[datetime]) -> EvaluationContext:
+        bars = self.data.bars(self.instrument.symbol,
+                              self.instrument.confirmation_timeframe)
+        ts = now or (bars[-1].ts if bars else datetime.utcnow())
+        self.session.tick(ts)
+
+        caps = self.data.capabilities()
+        vp = an.build_volume_profile(bars, self.instrument.tick_size,
+                                     self.instrument.value_area_pct) if bars else None
+        structure = (derive_structure(bars, self.instrument.swing_strength,
+                                      self.instrument.tick_size)
+                     if bars else Structure.UNDEFINED)
+
+        direction = self.plan.direction
+        leg = zone = None
+        if direction and len(bars) > self.instrument.swing_strength * 2:
+            leg = an.last_impulse_leg(bars, direction, self.instrument.swing_strength,
+                                      self.instrument.leg_lookback_bars)
+            if leg:
+                origin, extreme = leg
+                if self.strategy.has("L03"):
+                    zone = an.fib_zone(origin.price, extreme.price, direction)
+                elif vp is not None:
+                    # Ablation path: with no fib, the region of interest is
+                    # simply "beyond the value area edge", and the idea dies if
+                    # the impulse origin breaks. Stated explicitly because it
+                    # changes stop placement and therefore R.
+                    edge = vp.val if direction is Direction.LONG else vp.vah
+                    zone = an.FibZone(origin=origin.price, extreme=extreme.price,
+                                      direction=direction,
+                                      levels={0.705: edge, 0.886: origin.price})
+
+        # confirmation tracker follows one zone; rebuild if the leg changes
+        if zone is not None and direction is not None:
+            if self._tracker is None or self._tracker.zone.levels != zone.levels:
+                self._tracker = ConfirmationTracker(
+                    direction, zone, self.instrument.tick_size,
+                    self.strategy.confirmation,
+                    active_codes={c for c in self.strategy.condition_codes
+                                  if c.startswith("C")},
+                )
+                # Only the pullback is evidence. Bars that built the leg itself
+                # sit below the 0.886 by construction and must not be read as
+                # an invalidation of the pullback that has not happened yet.
+                self._fed = leg[1].index + 1
+            while self._fed < len(bars):
+                self._tracker.feed(bars[self._fed], self._fed)
+                self._fed += 1
+            self._evidence = self._tracker.evidence
+
+        news = self.news.upcoming(ts, NEWS_WINDOW_MINUTES)
+
+        ctx = EvaluationContext(
+            instrument=self.instrument,
+            plan=self.plan,
+            bars=bars,
+            now=ts,
+            capabilities=caps,
+            gex=self.options.gex(self.instrument.symbol),
+            evidence=self._evidence,
+            news=news,
+            volume_profile=vp,
+            leg=leg,
+            zone=zone,
+            derived_structure=structure,
+            minutes_since_open=self.session.minutes_since_open,
+        )
+        self._attach_risk(ctx)
+        return ctx
+
+    def _attach_risk(self, ctx: EvaluationContext) -> None:
+        d, ev = ctx.direction, ctx.evidence
+        if d is None or ctx.last is None:
+            return
+        buffer = self.instrument.stop_buffer_ticks * self.instrument.tick_size
+        # Preferred: the level the opposing side failed at. Fallback: the
+        # structural invalidation, so a strategy that does not use order flow
+        # still has a defined stop rather than silently never arming.
+        reference = ev.failure_level
+        ctx.stop_source = "order_flow_failure"
+        if reference is None and ctx.zone is not None:
+            reference, ctx.stop_source = ctx.zone.invalidation, "structural_invalidation"
+        if reference is not None:
+            ctx.stop = (reference - buffer if d is Direction.LONG
+                        else reference + buffer)
+        entry_bar = ev.confirming_bar or ctx.last
+        ctx.entry = entry_bar.close
+
+        target = an.next_swing_target(ctx.bars, d, ctx.entry, self.instrument.swing_strength)
+        kind = "swing_point"
+        if target is None and ctx.volume_profile is not None:
+            candidate = ctx.volume_profile.poc
+            if (d is Direction.LONG and candidate > ctx.entry) or \
+               (d is Direction.SHORT and candidate < ctx.entry):
+                target, kind = candidate, "poc"
+        if target is None:
+            wall = ctx.gex.call_wall if d is Direction.LONG else ctx.gex.put_wall
+            wall = wall or (self.plan.call_wall if d is Direction.LONG else self.plan.put_wall)
+            if wall is not None:
+                target, kind = wall, "gamma_wall"
+        ctx.target, ctx.target_kind = target, (kind if target is not None else None)
+
+        if ctx.stop is not None and ctx.target is not None:
+            ctx.rr = an.reward_risk(ctx.entry, ctx.stop, ctx.target)
+
+    # -- evaluation --------------------------------------------------------
+    def evaluate(self, now: Optional[datetime] = None) -> GateSnapshot:
+        ctx = self._build_context(now)
+        self.session.gate_attempts += 1
+
+        halts = evaluate_halts(ctx, self.session)
+        for h in halts:
+            if h.locks_session and not self.session.locked:
+                self.session.lock(f"{h.code} {h.label}")
+
+        stages: Dict[Stage, StageResult] = {}
+        blocker: Optional[Stage] = None
+        for stage in STAGE_ORDER:
+            results = []
+            for condition in self.strategy.conditions_for(stage):
+                result = condition.evaluate(ctx)
+                result.policy_satisfied = satisfies(
+                    result.status, self.strategy.policy_for(result.code))
+                results.append(result)
+            if any(r.status is ConditionStatus.FAILED and not r.satisfied
+                   for r in results):
+                status = StageStatus.FAILED
+            elif all(r.satisfied for r in results):
+                # An empty stage passes: a strategy that declares no conditions
+                # for it has nothing to check. Treating it as WAITING would
+                # make every ablation that removes a whole stage never arm.
+                status = StageStatus.PASS
+            else:
+                status = StageStatus.WAITING
+            if blocker is not None:
+                stages[stage] = StageResult(stage, StageStatus.LOCKED, results, blocker)
+            else:
+                stages[stage] = StageResult(stage, status, results)
+                if status is not StageStatus.PASS:
+                    blocker = stage
+
+        state = halt_state(halts)
+        if state is None:
+            if self.session.locked:
+                state = GateState.HALTED
+            elif not self.plan.is_locked:
+                state = GateState.LOCKED
+            elif all(s.status is StageStatus.PASS for s in stages.values()):
+                state = GateState.ARMED
+            else:
+                state = GateState.WAITING
+
+        snapshot = GateSnapshot(
+            ts=ctx.now,
+            instrument=self.instrument.symbol,
+            gate_state=state,
+            stages=stages,
+            halts=halts,
+            context=ctx,
+            session_health=self.session.health(),
+        )
+        self._emit(snapshot)
+        return snapshot
+
+    def _emit(self, snap: GateSnapshot) -> None:
+        ts = snap.ts
+        for stage in STAGE_ORDER:
+            sr = snap.stages[stage]
+            detail = ""
+            if sr.status is StageStatus.FAILED:
+                first = next(r for r in sr.results if r.status is ConditionStatus.FAILED)
+                detail = f"{first.code} {first.reason.value}"
+            elif sr.status is StageStatus.WAITING:
+                pending = [r for r in sr.results if r.status is ConditionStatus.WAITING]
+                if pending:
+                    detail = f"{pending[0].code} {pending[0].reason.value}"
+            elif sr.status is StageStatus.LOCKED:
+                detail = f"blocked by {sr.blocked_by.value}" if sr.blocked_by else ""
+            self.log.log(ts, stage.value, sr.status.value, detail,
+                         {"passed": sr.passed, "required": sr.required})
+
+        for h in snap.halts:
+            self.log.log(ts, "HALT", h.code, f"{h.label} - {h.reason.value}", h.to_dict())
+
+        if snap.gate_state is not self._last_state:
+            unverified = snap.unverified()
+            note = ("unverified: " + ",".join(unverified)) if unverified else ""
+            self.log.force(ts, "GATE", snap.gate_state.value, note,
+                           {"waiting_for": snap.waiting_for()[:4],
+                            "unverified": unverified})
+            if self._last_state is GateState.ARMED and snap.gate_state is not GateState.ARMED:
+                self.session.rejected_setups += 1
+            self._last_state = snap.gate_state
+
+    # -- trade lifecycle ---------------------------------------------------
+    def enter(self, snapshot: GateSnapshot, size: int = 1, override: bool = False,
+              override_reason: str = "") -> TradeRecord:
+        """Open a trade. Refuses unless ARMED.
+
+        `override=True` exists because a real trader can always click anyway;
+        the point is that the system records exactly what rule was broken
+        rather than pretending the trade was legitimate.
+        """
+        ctx = snapshot.context
+        if ctx is None or ctx.direction is None or ctx.entry is None:
+            raise ValueError("No tradeable context")
+        if not snapshot.armed and not override:
+            raise PermissionError(
+                f"Gate is {snapshot.gate_state.value}; waiting for "
+                f"{snapshot.waiting_for()[:3]}. Pass override=True to record a rule break."
+            )
+
+        stop = ctx.stop if ctx.stop is not None else (
+            ctx.entry - 10 * self.instrument.tick_size if ctx.direction is Direction.LONG
+            else ctx.entry + 10 * self.instrument.tick_size
+        )
+        trade = TradeRecord(
+            trade_id=str(uuid.uuid4())[:8],
+            instrument=self.instrument.symbol,
+            direction=ctx.direction,
+            entered_at=ctx.now,
+            entry=ctx.entry,
+            stop=stop,
+            target=ctx.target,
+            position_size=size,
+            market_regime=ctx.gex.regime,
+            structure=ctx.structure,
+            gate_state_at_entry=snapshot.gate_state,
+            conditions_passed=snapshot.conditions_passed(),
+            conditions_required=snapshot.conditions_required(),
+            unverified_conditions=snapshot.unverified(),
+            overridden_conditions=[] if snapshot.armed else snapshot.unsatisfied(),
+            halts_at_entry=[h.code for h in snapshot.halts],
+        )
+        if not snapshot.armed:
+            confirmation = snapshot.stages[Stage.CONFIRMATION]
+            if confirmation.status is not StageStatus.PASS:
+                trade.premature_entry = True
+                trade.violations.append(
+                    self.session.record_violation(
+                        ViolationKind.PREMATURE_ENTRY, ctx.now,
+                        override_reason or f"entered while {snapshot.gate_state.value}")
+                )
+            else:
+                trade.violations.append(
+                    self.session.record_violation(
+                        ViolationKind.PROHIBITED_SETUP, ctx.now,
+                        override_reason or f"entered while {snapshot.gate_state.value}")
+                )
+        self.session.open_trade(trade)
+        self._open_trade = trade
+        detail = (f"{trade.direction.value} {trade.entry} stop {trade.stop} "
+                  f"target {trade.target}")
+        if trade.overridden_conditions:
+            detail += f"  OVERRIDE {','.join(trade.overridden_conditions)}"
+        if trade.unverified_conditions:
+            detail += f"  unverified {','.join(trade.unverified_conditions)}"
+        self.log.force(ctx.now, "TRADE", "ENTERED", detail,
+                       {"trade_id": trade.trade_id, "size": size,
+                        "gate_state": snapshot.gate_state.value,
+                        "overridden": trade.overridden_conditions,
+                        "unverified": trade.unverified_conditions})
+        return trade
+
+    def manage(self, trade: TradeRecord, price: float,
+               reclaim_effort: bool = False) -> ManagementAction:
+        """R02: recommendation only. Nothing is executed automatically."""
+        ctx_profile = an.build_volume_profile(
+            self.data.bars(self.instrument.symbol, self.instrument.confirmation_timeframe),
+            self.instrument.tick_size, self.instrument.value_area_pct)
+        if ctx_profile is None:
+            return ManagementAction.HOLD
+        level = ctx_profile.val if trade.direction is Direction.LONG else ctx_profile.vah
+        reclaimed = price > level if trade.direction is Direction.LONG else price < level
+        if reclaimed:
+            return ManagementAction.HOLD
+        if reclaim_effort:
+            return ManagementAction.MOVE_TO_BREAK_EVEN
+        return ManagementAction.HOLD
+
+    def close(self, trade: TradeRecord, exit_price: float,
+              at: Optional[datetime] = None,
+              mae_r: Optional[float] = None,
+              mfe_r: Optional[float] = None) -> GradeResult:
+        at = at or self.session.now or trade.entered_at
+        trade.exit_price = exit_price
+        trade.exited_at = at
+        trade.r_result = an.r_multiple(trade.entry, trade.stop, exit_price, trade.direction)
+        trade.mae_r, trade.mfe_r = mae_r, mfe_r
+        grade = grade_trade(trade)
+        self._open_trade = None
+        self.log.force(at, "TRADE", "EXIT",
+                       f"{trade.r_result:+.2f}R  setup {grade.setup_quality} "
+                       f"execution {grade.execution_quality} -> {grade.classification.value}",
+                       {"trade_id": trade.trade_id, **grade.to_dict()})
+        if self.session.consecutive_losses >= self.session.max_consecutive_losses:
+            self.session.lock(
+                f"H05 {self.session.consecutive_losses} consecutive losses")
+            self.log.force(at, "HALT", "H05", "Consecutive loss limit - session locked",
+                           {"consecutive_losses": self.session.consecutive_losses})
+        # a new setup needs fresh evidence
+        self._tracker = None
+        self._fed = 0
+        self._evidence = ConfirmationEvidence()
+        return grade
+
+============================================================
+FILE: tradinggate\api.py
+============================================================
+"""The response shape a React frontend will consume.
+
+Keep this module the single place the wire format is defined. When Supabase
+arrives, the authoritative evaluation still runs server-side and returns this
+payload; the frontend renders it and never decides arming for itself.
+"""
+from __future__ import annotations
+
+from typing import Dict, List, Optional
+
+from .enums import STAGE_ORDER, GateState
+from .gate import GateSnapshot
+from .session import SessionState
+
+
+def gate_payload(snapshot: GateSnapshot, session: Optional[SessionState] = None) -> Dict:
+    ctx = snapshot.context
+    payload: Dict = {
+        "instrument": snapshot.instrument,
+        "ts": snapshot.ts.isoformat(),
+        "gate_state": snapshot.gate_state.value,
+        "hard_halt": snapshot.hard_halt,
+        "halts": [h.to_dict() for h in snapshot.halts],
+        "waiting_for": snapshot.waiting_for(),
+        "conditions_passed": snapshot.conditions_passed(),
+        "conditions_required": snapshot.conditions_required(),
+    }
+    for stage in STAGE_ORDER:
+        payload[stage.value.lower()] = snapshot.stages[stage].to_dict()
+
+    if ctx is not None:
+        payload["setup"] = {
+            "direction": ctx.direction.value if ctx.direction else None,
+            "structure": ctx.structure.value,
+            "gamma_regime": ctx.gex.regime.value,
+            "price": ctx.price,
+            "entry": ctx.entry,
+            "stop": ctx.stop,
+            "target": ctx.target,
+            "target_kind": ctx.target_kind,
+            "rr": round(ctx.rr, 3) if ctx.rr is not None else None,
+            "minimum_rr": ctx.instrument.minimum_rr,
+            "zone": (
+                {"low": ctx.zone.zone_low, "high": ctx.zone.zone_high,
+                 "invalidation_886": ctx.zone.invalidation,
+                 "levels": {str(k): round(v, 4) for k, v in ctx.zone.levels.items()}}
+                if ctx.zone else None
+            ),
+            "value_area": (
+                {"vah": ctx.volume_profile.vah, "val": ctx.volume_profile.val,
+                 "poc": ctx.volume_profile.poc, "source": ctx.volume_profile.source}
+                if ctx.volume_profile else None
+            ),
+            "data_capabilities": sorted(c.value for c in ctx.capabilities),
+        }
+        payload["evidence_notes"] = ctx.evidence.notes[-6:]
+
+    payload["session_health"] = snapshot.session_health or (
+        session.health() if session else {})
+    return payload
+
+
+def minimal_payload(snapshot: GateSnapshot) -> Dict:
+    """The compact shape from the original API sketch."""
+    out = {
+        "instrument": snapshot.instrument,
+        "gate_state": snapshot.gate_state.value,
+        "hard_halt": snapshot.hard_halt,
+    }
+    for stage in STAGE_ORDER:
+        sr = snapshot.stages[stage]
+        block: Dict = {"status": sr.status.value}
+        if sr.status.value != "PASS":
+            block.update({"passed": sr.passed, "required": sr.required,
+                          "waiting_for": sr.waiting_for()})
+        out[stage.value.lower()] = block
+    return out
+
+
+def explain(snapshot: GateSnapshot) -> str:
+    """Plain-language summary built from the deterministic result.
+
+    An LLM may later rewrite this text. It must never change the verdict.
+    """
+    state = snapshot.gate_state
+    if state is GateState.ARMED:
+        ctx = snapshot.context
+        rr = f"{ctx.rr:.2f}R" if ctx and ctx.rr else "the configured minimum"
+        return (f"Gate armed. Every condition is satisfied and no halt is active. "
+                f"Planned reward on risk is {rr}.")
+    if snapshot.halts:
+        first = snapshot.halts[0]
+        return f"Trade blocked. {first.label} ({first.reason.value})."
+    pending = snapshot.waiting_for()
+    if not pending:
+        return f"Gate is {state.value}."
+    return ("Trade remains locked. " + "; ".join(pending[:3]) +
+            (" and others outstanding." if len(pending) > 3 else "."))
+
+============================================================
+FILE: tradinggate\marketdata.py
+============================================================
+"""Market-data abstraction.
+
+Rules of this module:
+  * Nothing is fabricated. A bar without volume-at-price data reports that it
+    has no order flow; it does not get a synthesised delta.
+  * Providers advertise capabilities. Conditions that need a capability the
+    provider lacks resolve to WAITING / REQUIRED_DATA_UNAVAILABLE.
+"""
+from __future__ import annotations
+
+import json
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Set
+
+from .enums import Capability, GammaRegime
+
+
+@dataclass(frozen=True)
+class PriceLevel:
+    """One row of a footprint: volume traded at a price, split by aggressor.
+
+    ask_volume = filled at the offer  -> aggressive buyers
+    bid_volume = filled at the bid    -> aggressive sellers
+    """
+
+    price: float
+    bid_volume: int = 0
+    ask_volume: int = 0
+
+    @property
+    def volume(self) -> int:
+        return self.bid_volume + self.ask_volume
+
+    @property
+    def delta(self) -> int:
+        return self.ask_volume - self.bid_volume
+
+
+@dataclass
+class Bar:
+    ts: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: int
+    ladder: Optional[List[PriceLevel]] = None  # None => no order flow available
+
+    # ---- basic geometry -------------------------------------------------
+    @property
+    def range(self) -> float:
+        return max(self.high - self.low, 1e-12)
+
+    @property
+    def bullish(self) -> bool:
+        return self.close > self.open
+
+    @property
+    def bearish(self) -> bool:
+        return self.close < self.open
+
+    @property
+    def close_position(self) -> float:
+        """0.0 = closed on the low, 1.0 = closed on the high."""
+        return (self.close - self.low) / self.range
+
+    # ---- order flow (None when unavailable) -----------------------------
+    @property
+    def has_orderflow(self) -> bool:
+        return bool(self.ladder)
+
+    @property
+    def delta(self) -> Optional[int]:
+        if not self.ladder:
+            return None
+        return sum(level.delta for level in self.ladder)
+
+    @property
+    def poc(self) -> Optional[float]:
+        if not self.ladder:
+            return None
+        return max(self.ladder, key=lambda l: l.volume).price
+
+    def volume_in_band(self, low: float, high: float) -> Optional[int]:
+        if not self.ladder:
+            return None
+        return sum(l.volume for l in self.ladder if low <= l.price <= high)
+
+    def to_dict(self) -> dict:
+        payload = {
+            "ts": self.ts.isoformat(),
+            "open": self.open,
+            "high": self.high,
+            "low": self.low,
+            "close": self.close,
+            "volume": self.volume,
+        }
+        if self.ladder:
+            payload["ladder"] = [
+                {"price": l.price, "bid": l.bid_volume, "ask": l.ask_volume}
+                for l in self.ladder
+            ]
+        return payload
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "Bar":
+        ladder = None
+        if raw.get("ladder"):
+            ladder = [
+                PriceLevel(float(l["price"]), int(l.get("bid", 0)), int(l.get("ask", 0)))
+                for l in raw["ladder"]
+            ]
+        ts = raw["ts"]
+        ts = datetime.fromisoformat(ts) if isinstance(ts, str) else ts
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return cls(
+            ts=ts,
+            open=float(raw["open"]),
+            high=float(raw["high"]),
+            low=float(raw["low"]),
+            close=float(raw["close"]),
+            volume=int(raw["volume"]),
+            ladder=ladder,
+        )
+
+
+@dataclass
+class GexSnapshot:
+    regime: GammaRegime = GammaRegime.UNKNOWN
+    call_wall: Optional[float] = None
+    put_wall: Optional[float] = None
+    gamma_flip: Optional[float] = None
+    source: Optional[str] = None
+
+
+@dataclass
+class NewsEvent:
+    ts: datetime
+    title: str
+    impact: str  # LOW / MEDIUM / HIGH
+    currency: str = "USD"
+
+
+# ---------------------------------------------------------------------------
+# Interfaces
+# ---------------------------------------------------------------------------
+
+class MarketDataProvider(ABC):
+    name = "abstract"
+
+    @abstractmethod
+    def capabilities(self) -> Set[Capability]:
+        ...
+
+    @abstractmethod
+    def bars(self, symbol: str, timeframe: str, limit: int = 500) -> List[Bar]:
+        ...
+
+    def supports(self, capability: Capability) -> bool:
+        return capability in self.capabilities()
+
+
+class OptionsDataProvider(ABC):
+    name = "abstract"
+
+    @abstractmethod
+    def gex(self, symbol: str) -> GexSnapshot:
+        ...
+
+
+class NewsProvider(ABC):
+    name = "abstract"
+
+    @abstractmethod
+    def upcoming(self, at: datetime, within_minutes: int) -> Optional[List[NewsEvent]]:
+        """Return events, or None when no calendar feed is connected.
+
+        None and [] mean different things: None is "unknown", [] is "checked,
+        nothing scheduled". The gate treats them differently.
+        """
+
+
+class BrokerAdapter(ABC):
+    """Execution seam. Paper/replay implementations never touch a venue."""
+
+    name = "abstract"
+
+    @abstractmethod
+    def submit(self, order: dict) -> dict:
+        ...
+
+
+# ---------------------------------------------------------------------------
+# Null implementations - honest about knowing nothing
+# ---------------------------------------------------------------------------
+
+class NullOptionsProvider(OptionsDataProvider):
+    name = "null-options"
+
+    def gex(self, symbol: str) -> GexSnapshot:
+        return GexSnapshot(regime=GammaRegime.UNKNOWN, source=None)
+
+
+class StaticOptionsProvider(OptionsDataProvider):
+    """Levels a trader marked by hand from their GEX platform, pre-open."""
+
+    name = "static-options"
+
+    def __init__(self, snapshot: GexSnapshot):
+        self._snapshot = snapshot
+
+    def gex(self, symbol: str) -> GexSnapshot:
+        return self._snapshot
+
+
+class NullNewsProvider(NewsProvider):
+    name = "null-news"
+
+    def upcoming(self, at, within_minutes):
+        return None  # no feed configured; the gate will not invent one
+
+
+class StaticNewsProvider(NewsProvider):
+    name = "static-news"
+
+    def __init__(self, events: Sequence[NewsEvent]):
+        self._events = list(events)
+
+    def upcoming(self, at: datetime, within_minutes: int) -> List[NewsEvent]:
+        window = within_minutes * 60
+        return [
+            e for e in self._events
+            if 0 <= (e.ts - at).total_seconds() <= window
+        ]
+
+
+class PaperBroker(BrokerAdapter):
+    name = "paper"
+
+    def __init__(self):
+        self.orders: List[dict] = []
+
+    def submit(self, order: dict) -> dict:
+        self.orders.append(order)
+        return {"status": "FILLED_PAPER", "order": order}
+
+
+# ---------------------------------------------------------------------------
+# Concrete data providers
+# ---------------------------------------------------------------------------
+
+class ReplayProvider(MarketDataProvider):
+    """Feeds bars from a JSONL file one at a time.
+
+    `advance()` exposes the next bar; the gate only ever sees history up to the
+    current cursor, so a replay cannot leak the future into a decision.
+    """
+
+    name = "replay"
+
+    def __init__(self, path: Path | str, symbol: str, timeframe: str = "5m"):
+        self.path = Path(path)
+        self.symbol = symbol.upper()
+        self.timeframe = timeframe
+        self._all: List[Bar] = []
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                self._all.append(Bar.from_dict(json.loads(line)))
+        self.cursor = 0
+
+    @classmethod
+    def from_bars(cls, bars: Iterable[Bar], symbol: str, timeframe: str = "5m") -> "ReplayProvider":
+        obj = cls.__new__(cls)
+        obj.path = None
+        obj.symbol = symbol.upper()
+        obj.timeframe = timeframe
+        obj._all = list(bars)
+        obj.cursor = 0
+        return obj
+
+    def capabilities(self) -> Set[Capability]:
+        caps = {Capability.OHLCV, Capability.VOLUME_PROFILE}
+        if any(b.has_orderflow for b in self._all):
+            caps |= {Capability.VOLUME_AT_PRICE, Capability.DELTA, Capability.FOOTPRINT}
+        return caps
+
+    def bars(self, symbol: str, timeframe: str, limit: int = 500) -> List[Bar]:
+        return self._all[: self.cursor][-limit:]
+
+    @property
+    def exhausted(self) -> bool:
+        return self.cursor >= len(self._all)
+
+    def advance(self) -> Optional[Bar]:
+        if self.exhausted:
+            return None
+        bar = self._all[self.cursor]
+        self.cursor += 1
+        return bar
+
+    def now(self) -> Optional[datetime]:
+        if self.cursor == 0:
+            return None
+        return self._all[self.cursor - 1].ts
+
+
+class StrippedProvider(MarketDataProvider):
+    """Wraps another provider and removes order flow.
+
+    Used to prove the gate refuses to arm on OHLC alone.
+    """
+
+    name = "ohlcv-only"
+
+    def __init__(self, inner: MarketDataProvider):
+        self.inner = inner
+
+    def capabilities(self) -> Set[Capability]:
+        return {Capability.OHLCV, Capability.VOLUME_PROFILE}
+
+    def bars(self, symbol: str, timeframe: str, limit: int = 500) -> List[Bar]:
+        return [
+            Bar(b.ts, b.open, b.high, b.low, b.close, b.volume, ladder=None)
+            for b in self.inner.bars(symbol, timeframe, limit)
+        ]
+
+    def __getattr__(self, item):
+        return getattr(self.inner, item)
+
+============================================================
+FILE: tradinggate\config.py
+============================================================
+"""Configuration. Reads .env with no third-party dependency required.
+
+python-dotenv is used when installed, otherwise a small stdlib parser handles
+the same file format. The engine must run with nothing but the standard
+library so that a first-time user can clone and run it immediately.
+"""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+from .enums import TradingMode
+
+ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = ROOT / "data"
+
+
+def _parse_env_file(path: Path) -> dict:
+    values: dict = {}
+    if not path.exists():
+        return values
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        value = value.strip().strip('"').strip("'")
+        values[key.strip()] = value
+    return values
+
+
+def load_env(path: Optional[Path] = None) -> None:
+    """Populate os.environ from .env without overwriting real environment."""
+    path = path or (ROOT / ".env")
+    try:  # optional convenience
+        from dotenv import load_dotenv  # type: ignore
+
+        load_dotenv(path)
+        return
+    except Exception:
+        pass
+    for key, value in _parse_env_file(path).items():
+        os.environ.setdefault(key, value)
+
+
+def _get(key: str, default=None):
+    value = os.environ.get(key)
+    return default if value in (None, "") else value
+
+
+def _float(key: str, default: float) -> float:
+    try:
+        return float(_get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _int(key: str, default: int) -> int:
+    try:
+        return int(float(_get(key, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+@dataclass
+class Settings:
+    trading_mode: TradingMode = TradingMode.PAPER
+    default_instrument: str = "MNQ"
+
+    market_data_provider: Optional[str] = None
+    market_data_api_key: Optional[str] = None
+    broker_provider: Optional[str] = None
+    broker_account_id: Optional[str] = None
+    broker_api_key: Optional[str] = None
+    supabase_url: Optional[str] = None
+    supabase_key: Optional[str] = None
+    openai_api_key: Optional[str] = None
+
+    # strategy defaults; instrument profiles override these per symbol
+    min_rr: float = 1.5
+    max_consecutive_losses: int = 2
+    session_limit_minutes: int = 90
+
+    data_dir: Path = field(default=DATA_DIR)
+
+    @property
+    def live_enabled(self) -> bool:
+        """LIVE execution is off unless explicitly and unambiguously enabled."""
+        return (
+            self.trading_mode is TradingMode.LIVE
+            and _get("ALLOW_LIVE_EXECUTION", "false").lower() == "true"
+            and bool(self.broker_provider and self.broker_api_key)
+        )
+
+    @classmethod
+    def from_env(cls, env_path: Optional[Path] = None) -> "Settings":
+        load_env(env_path)
+        mode_raw = str(_get("TRADING_MODE", "PAPER")).upper()
+        try:
+            mode = TradingMode(mode_raw)
+        except ValueError:
+            mode = TradingMode.PAPER
+        return cls(
+            trading_mode=mode,
+            default_instrument=_get("DEFAULT_INSTRUMENT", "MNQ"),
+            market_data_provider=_get("MARKET_DATA_PROVIDER"),
+            market_data_api_key=_get("MARKET_DATA_API_KEY"),
+            broker_provider=_get("BROKER_PROVIDER"),
+            broker_account_id=_get("BROKER_ACCOUNT_ID"),
+            broker_api_key=_get("BROKER_API_KEY"),
+            supabase_url=_get("SUPABASE_URL"),
+            supabase_key=_get("SUPABASE_KEY"),
+            openai_api_key=_get("OPENAI_API_KEY"),
+            min_rr=_float("MIN_RR", 1.5),
+            max_consecutive_losses=_int("MAX_CONSECUTIVE_LOSSES", 2),
+            session_limit_minutes=_int("SESSION_LIMIT_MINUTES", 90),
+        )
+
+============================================================
+FILE: tradinggate\persistence.py
+============================================================
+"""Persistence.
+
+Version 1 writes JSON to ./data. The Store interface is deliberately shaped
+like the eventual Supabase tables so swapping the backend does not touch the
+engine.
+
+Planned tables:
+    users, strategies, strategy_rules, instrument_profiles, sessions,
+    gate_evaluations, gate_events, setups, trades, trade_execution_events,
+    rule_violations, execution_scores, market_snapshots, behaviour_metrics
+
+Authorisation note: when Supabase is connected, gate evaluation must run
+server-side (Postgres function or edge function) and the client must not be
+able to write `armed = true` directly. The frontend renders a verdict it did
+not compute.
+"""
+from __future__ import annotations
+
+import json
+from abc import ABC, abstractmethod
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from .events import Event
+from .session import SessionState, TradeRecord
+
+TABLES = (
+    "users", "strategies", "strategy_rules", "instrument_profiles", "sessions",
+    "gate_evaluations", "gate_events", "setups", "trades",
+    "trade_execution_events", "rule_violations", "execution_scores",
+    "market_snapshots", "behaviour_metrics",
+)
+
+
+class Store(ABC):
+    @abstractmethod
+    def save_session(self, session: SessionState, extra: Optional[Dict] = None) -> str: ...
+
+    @abstractmethod
+    def save_trade(self, session_key: str, trade: TradeRecord) -> None: ...
+
+    @abstractmethod
+    def save_events(self, session_key: str, events: List[Event]) -> None: ...
+
+    @abstractmethod
+    def load_trades(self) -> List[Dict]: ...
+
+
+class JsonStore(Store):
+    def __init__(self, root: Path | str = "data"):
+        self.root = Path(root)
+        (self.root / "sessions").mkdir(parents=True, exist_ok=True)
+
+    def _key(self, session: SessionState) -> str:
+        return f"{session.instrument}_{session.session_date}"
+
+    def _path(self, key: str) -> Path:
+        return self.root / "sessions" / f"{key}.json"
+
+    def _read(self, key: str) -> Dict:
+        path = self._path(key)
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+        return {"trades": [], "events": []}
+
+    def _write(self, key: str, doc: Dict) -> None:
+        self._path(key).write_text(json.dumps(doc, indent=2, default=str), encoding="utf-8")
+
+    def save_session(self, session: SessionState, extra: Optional[Dict] = None) -> str:
+        key = self._key(session)
+        doc = self._read(key)
+        doc.update({
+            "instrument": session.instrument,
+            "session_date": session.session_date,
+            "open_time": session.open_time.isoformat(),
+            "health": session.health(),
+            "saved_at": datetime.utcnow().isoformat(),
+        })
+        if extra:
+            doc.update(extra)
+        self._write(key, doc)
+        return key
+
+    def save_trade(self, session_key: str, trade: TradeRecord) -> None:
+        doc = self._read(session_key)
+        doc.setdefault("trades", [])
+        doc["trades"] = [t for t in doc["trades"] if t.get("trade_id") != trade.trade_id]
+        doc["trades"].append(trade.to_dict())
+        self._write(session_key, doc)
+
+    def save_events(self, session_key: str, events: List[Event]) -> None:
+        doc = self._read(session_key)
+        doc["events"] = [e.to_dict() for e in events]
+        self._write(session_key, doc)
+
+    def load_trades(self) -> List[Dict]:
+        out: List[Dict] = []
+        for path in sorted((self.root / "sessions").glob("*.json")):
+            out.extend(json.loads(path.read_text(encoding="utf-8")).get("trades", []))
+        return out
+
+
+class SupabaseStore(Store):
+    """Interface only. Requires SUPABASE_URL / SUPABASE_KEY and the supabase
+    package; raises clearly rather than silently degrading."""
+
+    def __init__(self, url: Optional[str], key: Optional[str]):
+        if not url or not key:
+            raise RuntimeError(
+                "SUPABASE_URL and SUPABASE_KEY are required for SupabaseStore. "
+                "Use JsonStore for local runs.")
+        try:
+            from supabase import create_client  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "pip install supabase to use SupabaseStore.") from exc
+        self.client = create_client(url, key)
+
+    def save_session(self, session, extra=None):
+        row = {"instrument": session.instrument, "session_date": session.session_date,
+               "open_time": session.open_time.isoformat(), "health": session.health()}
+        res = self.client.table("sessions").upsert(row).execute()
+        return res.data[0]["id"]
+
+    def save_trade(self, session_key, trade):
+        self.client.table("trades").upsert(
+            {"session_id": session_key, **trade.to_dict()}).execute()
+
+    def save_events(self, session_key, events):
+        self.client.table("gate_events").insert(
+            [{"session_id": session_key, **e.to_dict()} for e in events]).execute()
+
+    def load_trades(self):
+        return self.client.table("trades").select("*").execute().data
+
+============================================================
+FILE: tradinggate\session.py
+============================================================
+"""Session state and health.
+
+Health is arithmetic over recorded rule events. It is not a mood reading, a
+personality score or a psychological assessment - every point deducted maps to
+a counter the trader can see.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+
+from .enums import (
+    SERIOUS_VIOLATIONS,
+    Classification,
+    Direction,
+    GammaRegime,
+    GateState,
+    Structure,
+    ViolationKind,
+)
+
+
+@dataclass
+class Violation:
+    ts: datetime
+    kind: ViolationKind
+    note: str = ""
+
+    @property
+    def serious(self) -> bool:
+        return self.kind in SERIOUS_VIOLATIONS
+
+
+@dataclass
+class TradeRecord:
+    """One trade, with every field the breaking-point analytics will need."""
+
+    trade_id: str
+    instrument: str
+    direction: Direction
+    entered_at: datetime
+    entry: float
+    stop: float
+    target: Optional[float] = None
+    position_size: int = 1
+    exit_price: Optional[float] = None
+    exited_at: Optional[datetime] = None
+
+    # context at the moment of entry
+    market_regime: GammaRegime = GammaRegime.UNKNOWN
+    structure: Structure = Structure.UNDEFINED
+    gate_state_at_entry: GateState = GateState.WAITING
+    conditions_passed: int = 0
+    conditions_required: int = 0
+    time_since_open_min: Optional[float] = None
+    trade_number: int = 0
+    consecutive_losses_before: int = 0
+    consecutive_wins_before: int = 0
+
+    # audit trail
+    unverified_conditions: List[str] = field(default_factory=list)
+    overridden_conditions: List[str] = field(default_factory=list)
+    halts_at_entry: List[str] = field(default_factory=list)
+    exit_reason: Optional[str] = None
+
+    # behaviour
+    violations: List[Violation] = field(default_factory=list)
+    entry_delay_sec: Optional[float] = None
+    premature_entry: bool = False
+    chased_entry: bool = False
+    size_change: int = 0
+    stop_changes: int = 0
+
+    # excursion / result
+    mae_r: Optional[float] = None
+    mfe_r: Optional[float] = None
+    r_result: Optional[float] = None
+    setup_quality: Optional[str] = None
+    execution_quality: Optional[str] = None
+    classification: Optional[Classification] = None
+
+    @property
+    def closed(self) -> bool:
+        return self.r_result is not None
+
+    @property
+    def is_loss(self) -> bool:
+        return self.r_result is not None and self.r_result < 0
+
+    @property
+    def is_win(self) -> bool:
+        return self.r_result is not None and self.r_result > 0
+
+    @property
+    def serious_violations(self) -> List[Violation]:
+        return [v for v in self.violations if v.serious]
+
+    def to_dict(self) -> Dict:
+        return {
+            "trade_id": self.trade_id,
+            "instrument": self.instrument,
+            "direction": self.direction.value,
+            "entered_at": self.entered_at.isoformat(),
+            "exited_at": self.exited_at.isoformat() if self.exited_at else None,
+            "entry": self.entry, "stop": self.stop, "target": self.target,
+            "exit_price": self.exit_price,
+            "position_size": self.position_size,
+            "market_regime": self.market_regime.value,
+            "structure": self.structure.value,
+            "gate_state_at_entry": self.gate_state_at_entry.value,
+            "conditions_passed": self.conditions_passed,
+            "conditions_required": self.conditions_required,
+            "time_since_open_min": self.time_since_open_min,
+            "trade_number": self.trade_number,
+            "consecutive_losses_before": self.consecutive_losses_before,
+            "consecutive_wins_before": self.consecutive_wins_before,
+            "unverified_conditions": list(self.unverified_conditions),
+            "overridden_conditions": list(self.overridden_conditions),
+            "halts_at_entry": list(self.halts_at_entry),
+            "exit_reason": self.exit_reason,
+            "rule_violations": [v.kind.value for v in self.violations],
+            "serious_rule_violations": [v.kind.value for v in self.serious_violations],
+            "entry_delay_sec": self.entry_delay_sec,
+            "premature_entry": self.premature_entry,
+            "chased_entry": self.chased_entry,
+            "size_change": self.size_change,
+            "stop_changes": self.stop_changes,
+            "mae_r": self.mae_r, "mfe_r": self.mfe_r, "r_result": self.r_result,
+            "setup_quality": self.setup_quality,
+            "execution_quality": self.execution_quality,
+            "classification": self.classification.value if self.classification else None,
+        }
+
+
+@dataclass
+class SessionState:
+    instrument: str
+    session_date: str
+    open_time: datetime
+    limit_minutes: int = 90
+    max_consecutive_losses: int = 2
+
+    now: Optional[datetime] = None
+    trades: List[TradeRecord] = field(default_factory=list)
+    violations: List[Violation] = field(default_factory=list)
+    gate_attempts: int = 0
+    rejected_setups: int = 0
+    locked: bool = False
+    lock_reason: Optional[str] = None
+
+    # -- clock -----------------------------------------------------------
+    def tick(self, now: datetime) -> None:
+        self.now = now
+
+    @property
+    def minutes_since_open(self) -> Optional[float]:
+        if self.now is None:
+            return None
+        return (self.now - self.open_time).total_seconds() / 60.0
+
+    @property
+    def minutes_remaining(self) -> Optional[float]:
+        m = self.minutes_since_open
+        if m is None:
+            return None
+        return max(self.limit_minutes - m, 0.0)
+
+    @property
+    def past_cutoff(self) -> bool:
+        m = self.minutes_since_open
+        return m is not None and m > self.limit_minutes
+
+    # -- counters --------------------------------------------------------
+    @property
+    def closed_trades(self) -> List[TradeRecord]:
+        return [t for t in self.trades if t.closed]
+
+    @property
+    def consecutive_losses(self) -> int:
+        run = 0
+        for t in reversed(self.closed_trades):
+            if t.is_loss:
+                run += 1
+            else:
+                break
+        return run
+
+    @property
+    def consecutive_wins(self) -> int:
+        run = 0
+        for t in reversed(self.closed_trades):
+            if t.is_win:
+                run += 1
+            else:
+                break
+        return run
+
+    @property
+    def cumulative_r(self) -> float:
+        return round(sum(t.r_result or 0.0 for t in self.closed_trades), 3)
+
+    @property
+    def all_violations(self) -> List[Violation]:
+        out = list(self.violations)
+        for t in self.trades:
+            out.extend(t.violations)
+        return out
+
+    @property
+    def serious_violations(self) -> List[Violation]:
+        return [v for v in self.all_violations if v.serious]
+
+    # -- mutation --------------------------------------------------------
+    def record_violation(self, kind: ViolationKind, at: datetime, note: str = "") -> Violation:
+        v = Violation(ts=at, kind=kind, note=note)
+        self.violations.append(v)
+        if v.serious:
+            self.lock(f"H06 serious rule violation: {kind.value}"
+                      + (f" - {note}" if note else ""))
+        return v
+
+    def lock(self, reason: str) -> None:
+        self.locked = True
+        self.lock_reason = reason
+
+    def open_trade(self, record: TradeRecord) -> TradeRecord:
+        record.trade_number = len(self.trades) + 1
+        record.consecutive_losses_before = self.consecutive_losses
+        record.consecutive_wins_before = self.consecutive_wins
+        record.time_since_open_min = self.minutes_since_open
+        self.trades.append(record)
+        return record
+
+    # -- health ----------------------------------------------------------
+    def health(self) -> Dict:
+        score = 100
+        breakdown = []
+
+        cl = self.consecutive_losses
+        if self.max_consecutive_losses > 0 and cl:
+            penalty = int(35 * min(cl / self.max_consecutive_losses, 1.0))
+            score -= penalty
+            breakdown.append({"factor": "consecutive_losses",
+                              "value": f"{cl}/{self.max_consecutive_losses}",
+                              "penalty": penalty})
+
+        minor = [v for v in self.all_violations if not v.serious]
+        if minor:
+            penalty = min(len(minor) * 8, 24)
+            score -= penalty
+            breakdown.append({"factor": "rule_violations", "value": len(minor),
+                              "penalty": penalty})
+
+        serious = self.serious_violations
+        if serious:
+            score -= 40
+            breakdown.append({"factor": "serious_rule_violations",
+                              "value": len(serious), "penalty": 40})
+
+        r = self.cumulative_r
+        if r <= -1.0:
+            penalty = min(int(abs(r) * 6), 18)
+            score -= penalty
+            breakdown.append({"factor": "cumulative_r", "value": r, "penalty": penalty})
+
+        score = max(0, min(100, score))
+
+        if self.locked:
+            risk = "SESSION_LOCKED"
+        elif serious or cl >= self.max_consecutive_losses:
+            risk = "HIGH"
+        elif cl >= max(self.max_consecutive_losses - 1, 1) or len(minor) >= 2:
+            risk = "ELEVATED"
+        elif len(self.trades) >= 3 or minor:
+            risk = "MODERATE"
+        else:
+            risk = "LOW"
+
+        return {
+            "score": score,
+            "trades": len(self.trades),
+            "consecutive_losses": cl,
+            "max_consecutive_losses": self.max_consecutive_losses,
+            "consecutive_wins": self.consecutive_wins,
+            "rule_violations": len(minor),
+            "serious_rule_violations": len(serious),
+            "cumulative_r": r,
+            "gate_attempts": self.gate_attempts,
+            "rejected_setups": self.rejected_setups,
+            "minutes_since_open": round(self.minutes_since_open, 1) if self.minutes_since_open is not None else None,
+            "minutes_remaining": round(self.minutes_remaining, 1) if self.minutes_remaining is not None else None,
+            "decision_risk": risk,
+            "locked": self.locked,
+            "lock_reason": self.lock_reason,
+            "breakdown": breakdown,
+            "basis": "derived from recorded rule counters only",
+        }
+
+
+def new_york_open(day: datetime, hour: int = 13, minute: int = 30) -> datetime:
+    """NY cash open expressed in UTC (13:30 UTC during US daylight time).
+
+    Replace with a tz-aware calendar when a real feed is connected; kept
+    explicit here so nothing silently assumes a timezone.
+    """
+    return day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+============================================================
+FILE: tradinggate\events.py
+============================================================
+"""Event log.
+
+Every evaluation is logged, not just the ones that turn into trades. The
+rejected setups are the interesting half of the record.
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional
+
+
+@dataclass
+class Event:
+    ts: datetime
+    kind: str          # ENVIRONMENT | LOCATION | CONFIRMATION | RISK | GATE | TRADE | HALT | RULE
+    status: str        # PASS | WAITING | FAILED | ARMED | ENTERED | EXIT ...
+    message: str = ""
+    payload: Dict = field(default_factory=dict)
+
+    def line(self) -> str:
+        head = f"{self.ts.strftime('%H:%M:%S')} {self.kind:<12} {self.status}"
+        return f"{head} - {self.message}" if self.message else head
+
+    def to_dict(self) -> Dict:
+        return {"ts": self.ts.isoformat(), "kind": self.kind, "status": self.status,
+                "message": self.message, "payload": self.payload}
+
+
+class EventLogger:
+    def __init__(self, sink: Optional[Path] = None, echo: bool = False,
+                 dedupe: bool = True):
+        self.events: List[Event] = []
+        self.sink = Path(sink) if sink else None
+        self.echo = echo
+        self.dedupe = dedupe
+        self._last_key: Dict[str, str] = {}
+        if self.sink:
+            self.sink.parent.mkdir(parents=True, exist_ok=True)
+
+    def log(self, ts: datetime, kind: str, status: str, message: str = "",
+            payload: Optional[Dict] = None) -> Optional[Event]:
+        key = f"{status}|{message}"
+        if self.dedupe and self._last_key.get(kind) == key:
+            return None
+        self._last_key[kind] = key
+        event = Event(ts=ts, kind=kind, status=status, message=message,
+                      payload=payload or {})
+        self.events.append(event)
+        if self.echo:
+            print(event.line())
+        if self.sink:
+            with self.sink.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(event.to_dict()) + "\n")
+        return event
+
+    def force(self, ts: datetime, kind: str, status: str, message: str = "",
+              payload: Optional[Dict] = None) -> Event:
+        """Log without deduplication - used for trades and halts."""
+        self._last_key.pop(kind, None)
+        event = self.log(ts, kind, status, message, payload)
+        assert event is not None
+        return event
+
+    def render(self) -> str:
+        return "\n".join(e.line() for e in self.events)
+
+    def to_list(self) -> List[Dict]:
+        return [e.to_dict() for e in self.events]
+
+============================================================
+FILE: tradinggate\instruments.py
+============================================================
+"""Instrument profiles.
+
+A threshold calibrated on one instrument is meaningless on another. The
+20,000-contract participation floor is an MNQ starting rule; every other
+instrument ships with `minimum_volume=None`, which makes the participation
+halt report THRESHOLD_NOT_CALIBRATED instead of silently reusing MNQ's number.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, Optional
+
+
+@dataclass(frozen=True)
+class InstrumentProfile:
+    symbol: str
+    name: str
+    tick_size: float
+    tick_value: float
+    confirmation_timeframe: str = "5m"
+    context_timeframes: tuple = ("15m", "1h")
+    # None means "not calibrated for this instrument yet" - never inherited.
+    minimum_volume: Optional[int] = None
+    minimum_rr: float = 1.5
+    max_consecutive_losses: int = 2
+    session_limit_minutes: int = 90
+    session_open: str = "09:30"       # local exchange session used for the cutoff
+    session_timezone: str = "America/New_York"
+    imbalance_ratio: float = 4.0      # 400%
+    min_imbalance_levels: int = 2
+    swing_strength: int = 2
+    leg_lookback_bars: int = 40
+    value_area_pct: float = 0.70
+    lvn_threshold_pct: float = 0.35   # node volume vs POC volume
+    stop_buffer_ticks: int = 4
+    # Futures supplies the analytics; execution may happen on a CFD/FX symbol.
+    execution_symbol: Optional[str] = None
+    execution_venue: Optional[str] = None
+    price_map_tolerance: Optional[float] = None
+    notes: str = ""
+    extras: Dict[str, object] = field(default_factory=dict)
+
+    @property
+    def volume_calibrated(self) -> bool:
+        return self.minimum_volume is not None
+
+    @property
+    def analysis_symbol(self) -> str:
+        return self.symbol
+
+
+INSTRUMENT_PROFILES: Dict[str, InstrumentProfile] = {
+    "MNQ": InstrumentProfile(
+        symbol="MNQ",
+        name="Micro E-mini Nasdaq-100",
+        tick_size=0.25,
+        tick_value=0.50,
+        minimum_volume=20000,
+        minimum_rr=1.5,
+        max_consecutive_losses=2,
+        session_limit_minutes=90,
+        execution_symbol="NAS100",
+        execution_venue="CFD",
+        price_map_tolerance=5.0,
+        notes="Reference profile. 20,000 contracts per 5m bar is an MNQ rule only.",
+    ),
+    "NQ": InstrumentProfile(
+        symbol="NQ",
+        name="E-mini Nasdaq-100",
+        tick_size=0.25,
+        tick_value=5.00,
+        minimum_volume=None,
+        execution_symbol="NAS100",
+        execution_venue="CFD",
+        price_map_tolerance=5.0,
+        notes="Same underlying as MNQ but a different contract - calibrate its own floor.",
+    ),
+    "ES": InstrumentProfile("ES", "E-mini S&P 500", 0.25, 12.50,
+                            execution_symbol="US500", execution_venue="CFD",
+                            price_map_tolerance=2.0),
+    "MES": InstrumentProfile("MES", "Micro E-mini S&P 500", 0.25, 1.25,
+                             execution_symbol="US500", execution_venue="CFD",
+                             price_map_tolerance=2.0),
+    "GC": InstrumentProfile("GC", "Gold", 0.10, 10.00,
+                            execution_symbol="XAUUSD", execution_venue="CFD",
+                            price_map_tolerance=1.5),
+    "MGC": InstrumentProfile("MGC", "Micro Gold", 0.10, 1.00,
+                             execution_symbol="XAUUSD", execution_venue="CFD",
+                             price_map_tolerance=1.5),
+    "CL": InstrumentProfile("CL", "Crude Oil", 0.01, 10.00,
+                            execution_symbol="USOIL", execution_venue="CFD",
+                            price_map_tolerance=0.10),
+    "MCL": InstrumentProfile("MCL", "Micro Crude Oil", 0.01, 1.00,
+                             execution_symbol="USOIL", execution_venue="CFD",
+                             price_map_tolerance=0.10),
+    "6E": InstrumentProfile("6E", "Euro FX", 0.00005, 6.25,
+                            execution_symbol="EURUSD", execution_venue="FX",
+                            price_map_tolerance=0.0010),
+    "6B": InstrumentProfile("6B", "British Pound", 0.0001, 6.25,
+                            execution_symbol="GBPUSD", execution_venue="FX",
+                            price_map_tolerance=0.0015),
+    "6J": InstrumentProfile("6J", "Japanese Yen", 0.0000005, 6.25,
+                            execution_symbol="USDJPY", execution_venue="FX",
+                            price_map_tolerance=0.05,
+                            notes="6J is JPY/USD; USDJPY is inverted. Map before comparing."),
+    "6A": InstrumentProfile("6A", "Australian Dollar", 0.0001, 10.00,
+                            execution_symbol="AUDUSD", execution_venue="FX",
+                            price_map_tolerance=0.0010),
+    "6C": InstrumentProfile("6C", "Canadian Dollar", 0.00005, 5.00,
+                            execution_symbol="USDCAD", execution_venue="FX",
+                            price_map_tolerance=0.0010,
+                            notes="6C is CAD/USD; USDCAD is inverted."),
+    "6S": InstrumentProfile("6S", "Swiss Franc", 0.0001, 12.50,
+                            execution_symbol="USDCHF", execution_venue="FX",
+                            price_map_tolerance=0.0010,
+                            notes="6S is CHF/USD; USDCHF is inverted."),
+}
+
+
+class UnknownInstrument(KeyError):
+    pass
+
+
+def get_profile(symbol: str) -> InstrumentProfile:
+    try:
+        return INSTRUMENT_PROFILES[symbol.upper()]
+    except KeyError as exc:  # never fall back to another instrument's numbers
+        raise UnknownInstrument(
+            f"No profile for {symbol!r}. Add one to INSTRUMENT_PROFILES - "
+            "thresholds are not transferable between instruments."
+        ) from exc
+
+
+def register_profile(profile: InstrumentProfile) -> None:
+    INSTRUMENT_PROFILES[profile.symbol.upper()] = profile
+
+============================================================
+FILE: tradinggate\confirmation.py
+============================================================
+"""Stage 3 evidence collection.
+
+This is a sequential state machine, not a snapshot test. The order of events
+matters: absorption on its own is not a signal, and the engine will not accept
+the first failure as confirmation - it waits for the opposing side to try
+again and fail at a worse level.
+
+If order-flow data is missing, nothing here fires. Ordinary OHLC candles are
+never promoted into confirmation evidence.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import List, Optional, Sequence, Set
+
+from .analytics import FibZone, diagonal_imbalances, extreme_concentration
+from .enums import Direction
+from .marketdata import Bar
+
+
+@dataclass(frozen=True)
+class ConfirmationConfig:
+    min_delta_ratio: float = 0.10      # |delta| / bar volume
+    min_extreme_concentration: float = 0.30
+    extreme_band_pct: float = 0.34
+    imbalance_ratio: float = 4.0       # 400%
+    min_imbalance_levels: int = 2
+    max_bars_between_attempts: int = 8
+    require_second_attempt_worse: bool = True
+
+
+@dataclass
+class Attempt:
+    index: int
+    ts: object
+    extreme: float          # the low (long) / high (short) the opposing side reached
+    delta: int
+    concentration: float
+    absorbed: bool = False
+
+
+@dataclass
+class ConfirmationEvidence:
+    orderflow_available: bool = False
+    first_attempt: Optional[Attempt] = None
+    absorption: bool = False
+    dominance_shift_index: Optional[int] = None
+    second_attempt: Optional[Attempt] = None
+    second_attempt_failed_better: bool = False
+    imbalances: List[object] = field(default_factory=list)
+    imbalance_ok: bool = False
+    confirming_bar: Optional[Bar] = None
+    failure_level: Optional[float] = None   # stop reference (R01)
+    invalidated: bool = False
+    notes: List[str] = field(default_factory=list)
+
+    @property
+    def aggression_ok(self) -> bool:
+        return self.first_attempt is not None
+
+    @property
+    def dominance_ok(self) -> bool:
+        return self.dominance_shift_index is not None
+
+    @property
+    def second_attempt_ok(self) -> bool:
+        return self.second_attempt is not None and self.second_attempt_failed_better
+
+    def waiting_for(self) -> List[str]:
+        pending = []
+        if not self.orderflow_available:
+            return ["ORDER_FLOW_DATA"]
+        if not self.aggression_ok:
+            pending.append("AGGRESSION_AT_EXTREME")
+        if not self.absorption:
+            pending.append("ABSORPTION")
+        if not self.dominance_ok:
+            pending.append("DOMINANCE_SHIFT")
+        if not self.second_attempt_ok:
+            pending.append("SECOND_ATTEMPT_FAILURE")
+        if not self.imbalance_ok:
+            pending.append("FOOTPRINT_IMBALANCE")
+        return [p for p in pending if p]
+
+
+class ConfirmationTracker:
+    """Consumes bars in order and accumulates evidence for one setup."""
+
+    def __init__(
+        self,
+        direction: Direction,
+        zone: FibZone,
+        tick_size: float,
+        config: Optional[ConfirmationConfig] = None,
+        active_codes: Optional[Set[str]] = None,
+    ):
+        self.direction = direction
+        self.zone = zone
+        self.tick = tick_size
+        self.cfg = config or ConfirmationConfig()
+        #: Which C-conditions the running strategy actually uses. The state
+        #: machine is sequential, so a strategy that drops C04 must not still
+        #: be made to wait for a second attempt before C05 can be reached -
+        #: otherwise an ablation silently measures nothing.
+        self.active = set(active_codes) if active_codes is not None else {
+            "C01", "C02", "C03", "C04", "C05"}
+        self.evidence = ConfirmationEvidence()
+        self._engaged = False
+
+    # -- helpers ---------------------------------------------------------
+    def _is_opposing_aggression(self, bar: Bar) -> bool:
+        delta = bar.delta
+        if delta is None or bar.volume <= 0:
+            return False
+        strength = abs(delta) / bar.volume
+        if strength < self.cfg.min_delta_ratio:
+            return False
+        if self.direction is Direction.LONG and delta >= 0:
+            return False
+        if self.direction is Direction.SHORT and delta <= 0:
+            return False
+        conc = extreme_concentration(bar, self.direction, self.cfg.extreme_band_pct)
+        return conc is not None and conc >= self.cfg.min_extreme_concentration
+
+    def _extreme(self, bar: Bar) -> float:
+        return bar.low if self.direction is Direction.LONG else bar.high
+
+    def _responded(self, bar: Bar) -> bool:
+        """Did the bar close back against the aggressor?"""
+        if self.direction is Direction.LONG:
+            return bar.close_position >= 0.5
+        return bar.close_position <= 0.5
+
+    def _worse_for_opposition(self, later: float, earlier: float) -> bool:
+        """Second attempt must fail at a level that is worse for the loser:
+        higher low for a long setup, lower high for a short setup."""
+        if self.direction is Direction.LONG:
+            return later > earlier + self.tick
+        return later < earlier - self.tick
+
+    def _imbalance_side(self) -> str:
+        return "ask" if self.direction is Direction.LONG else "bid"
+
+    # -- main ------------------------------------------------------------
+    def feed(self, bar: Bar, index: int) -> ConfirmationEvidence:
+        ev = self.evidence
+        ev.orderflow_available = ev.orderflow_available or bar.has_orderflow
+        if not bar.has_orderflow:
+            return ev
+
+        # H03 lives here too: a breach of the 0.886 kills the setup outright.
+        extreme = self._extreme(bar)
+        if self.direction is Direction.LONG and extreme < self.zone.invalidation - self.tick:
+            ev.invalidated = True
+            ev.notes.append(f"bar {index}: low {extreme} through 0.886 {self.zone.invalidation}")
+            return ev
+        if self.direction is Direction.SHORT and extreme > self.zone.invalidation + self.tick:
+            ev.invalidated = True
+            ev.notes.append(f"bar {index}: high {extreme} through 0.886 {self.zone.invalidation}")
+            return ev
+
+        in_zone = self.zone.contains(extreme) or self.zone.contains(bar.close)
+        if in_zone:
+            self._engaged = True
+        if not self._engaged:
+            return ev
+
+        aggression = self._is_opposing_aggression(bar)
+        responded = self._responded(bar)
+
+        # --- C01 first attempt -----------------------------------------
+        if ev.first_attempt is None:
+            if aggression and in_zone:
+                ev.first_attempt = Attempt(
+                    index=index, ts=bar.ts, extreme=extreme,
+                    delta=bar.delta or 0,
+                    concentration=extreme_concentration(bar, self.direction,
+                                                        self.cfg.extreme_band_pct) or 0.0,
+                )
+                ev.failure_level = extreme
+                ev.notes.append(f"bar {index}: aggression at extreme, delta {bar.delta}")
+                # C02 can register on the same bar if the push produced no result
+                if responded:
+                    ev.first_attempt.absorbed = True
+                    ev.absorption = True
+                    ev.notes.append(f"bar {index}: effort without result - absorption")
+            return ev
+
+        first = ev.first_attempt
+
+        # --- C02 absorption confirmed by the following bar --------------
+        if not ev.absorption:
+            if not self._worse_for_opposition(extreme, first.extreme) and aggression:
+                # they kept pushing and got somewhere - refresh the attempt
+                ev.first_attempt = Attempt(index, bar.ts, extreme, bar.delta or 0,
+                                           extreme_concentration(bar, self.direction,
+                                                                 self.cfg.extreme_band_pct) or 0.0)
+                ev.failure_level = extreme
+                return ev
+            if self._worse_for_opposition(extreme, first.extreme) or responded:
+                first.absorbed = True
+                ev.absorption = True
+                ev.notes.append(f"bar {index}: no progression beyond {first.extreme} - absorption")
+
+        if not ev.absorption:
+            return ev
+
+        # --- C03 dominance shift ----------------------------------------
+        if ev.dominance_shift_index is None:
+            shifted = bar.bullish if self.direction is Direction.LONG else bar.bearish
+            delta = bar.delta or 0
+            with_us = delta > 0 if self.direction is Direction.LONG else delta < 0
+            if shifted and with_us:
+                ev.dominance_shift_index = index
+                ev.notes.append(f"bar {index}: dominance shifts, delta {delta}")
+            return ev
+
+        # --- C04 second attempt, failing at a worse level ---------------
+        if "C04" not in self.active and ev.second_attempt is None:
+            # Strategy does not require a second failure: the dominance shift
+            # itself completes the sequence, and the stop references the first
+            # failure instead of the second.
+            ev.second_attempt = Attempt(ev.dominance_shift_index, bar.ts,
+                                        first.extreme, first.delta,
+                                        first.concentration, absorbed=True)
+            ev.second_attempt_failed_better = True
+            ev.failure_level = first.extreme
+            ev.notes.append("C04 not required by this strategy - skipped")
+
+        if ev.second_attempt is None:
+            if index - ev.dominance_shift_index > self.cfg.max_bars_between_attempts:
+                ev.notes.append(f"bar {index}: second attempt window expired - evidence reset")
+                self.evidence = ConfirmationEvidence(orderflow_available=True,
+                                                     notes=list(ev.notes))
+                return self.evidence
+            if aggression:
+                worse = self._worse_for_opposition(extreme, first.extreme)
+                if not worse and self.cfg.require_second_attempt_worse:
+                    ev.notes.append(
+                        f"bar {index}: second push reached {extreme}, not better than "
+                        f"{first.extreme} - not a valid second failure")
+                    return ev
+                ev.second_attempt = Attempt(index, bar.ts, extreme, bar.delta or 0,
+                                            extreme_concentration(bar, self.direction,
+                                                                  self.cfg.extreme_band_pct) or 0.0)
+                if responded:
+                    ev.second_attempt.absorbed = True
+                    ev.second_attempt_failed_better = True
+                    ev.failure_level = extreme
+                    ev.notes.append(f"bar {index}: second attempt fails at {extreme}")
+            return ev
+
+        if ev.second_attempt is not None and not ev.second_attempt_failed_better:
+            if self._worse_for_opposition(extreme, ev.second_attempt.extreme) or responded:
+                ev.second_attempt.absorbed = True
+                ev.second_attempt_failed_better = True
+                ev.failure_level = ev.second_attempt.extreme
+                ev.notes.append(f"bar {index}: second attempt confirmed failed")
+            return ev
+
+        # --- C05 imbalance on the confirming bar ------------------------
+        if not ev.imbalance_ok:
+            imbs = [i for i in diagonal_imbalances(bar, self.cfg.imbalance_ratio)
+                    if i.side == self._imbalance_side()]
+            ev.imbalances = imbs
+            if len(imbs) >= self.cfg.min_imbalance_levels:
+                ev.imbalance_ok = True
+                ev.confirming_bar = bar
+                ev.notes.append(
+                    f"bar {index}: {len(imbs)} {self._imbalance_side()}-side imbalances "
+                    f"at >= {self.cfg.imbalance_ratio * 100:.0f}%")
+        return ev
+
+    def run(self, bars: Sequence[Bar]) -> ConfirmationEvidence:
+        for i, bar in enumerate(bars):
+            self.feed(bar, i)
+            if self.evidence.invalidated:
+                break
+        return self.evidence
+
+============================================================
+FILE: tradinggate\conditions.py
+============================================================
+"""The individual gate conditions.
+
+Each returns PASS / WAITING / FAILED / NOT_APPLICABLE with a machine-readable
+reason. NOT_APPLICABLE means "this condition genuinely does not apply to this
+setup or no feed is connected" - it does not block a stage, and it is always
+visible in the API output so nobody mistakes it for a pass.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
+
+from . import analytics as an
+from .analytics import FibZone, Swing, VolumeProfile
+from .confirmation import ConfirmationEvidence
+from .enums import (
+    Capability,
+    ConditionStatus,
+    Direction,
+    GammaRegime,
+    Reason,
+    Stage,
+    Structure,
+)
+from .instruments import InstrumentProfile
+from .marketdata import Bar, GexSnapshot, NewsEvent
+from .plan import PreMarketPlan
+
+
+@dataclass
+class ConditionResult:
+    code: str
+    label: str
+    stage: Stage
+    status: ConditionStatus
+    reason: Reason = Reason.OK
+    detail: Dict = field(default_factory=dict)
+    #: set by the engine from the strategy's policy for this condition
+    policy_satisfied: Optional[bool] = None
+
+    @property
+    def satisfied(self) -> bool:
+        if self.policy_satisfied is not None:
+            return self.policy_satisfied
+        return self.status in (ConditionStatus.PASS, ConditionStatus.NOT_APPLICABLE)
+
+    @property
+    def verified(self) -> bool:
+        """False when the condition contributed to arming without being checked."""
+        return self.status is not ConditionStatus.UNKNOWN
+
+    def to_dict(self) -> Dict:
+        return {
+            "code": self.code,
+            "label": self.label,
+            "stage": self.stage.value,
+            "status": self.status.value,
+            "reason": self.reason.value,
+            "verified": self.verified,
+            "detail": self.detail,
+        }
+
+
+@dataclass
+class EvaluationContext:
+    instrument: InstrumentProfile
+    plan: PreMarketPlan
+    bars: List[Bar]
+    now: datetime
+    capabilities: Set[Capability]
+    gex: GexSnapshot
+    evidence: ConfirmationEvidence
+    news: Optional[List[NewsEvent]] = None
+    volume_profile: Optional[VolumeProfile] = None
+    leg: Optional[Tuple[Swing, Swing]] = None
+    zone: Optional[FibZone] = None
+    derived_structure: Structure = Structure.UNDEFINED
+    entry: Optional[float] = None
+    stop: Optional[float] = None
+    target: Optional[float] = None
+    target_kind: Optional[str] = None
+    rr: Optional[float] = None
+    stop_source: Optional[str] = None
+    minutes_since_open: Optional[float] = None
+
+    @property
+    def direction(self) -> Optional[Direction]:
+        return self.plan.direction
+
+    @property
+    def last(self) -> Optional[Bar]:
+        return self.bars[-1] if self.bars else None
+
+    @property
+    def price(self) -> Optional[float]:
+        return self.last.close if self.last else None
+
+    @property
+    def structure(self) -> Structure:
+        if self.plan.htf_structure is not Structure.UNDEFINED:
+            return self.plan.htf_structure
+        return self.derived_structure
+
+    @property
+    def has_orderflow(self) -> bool:
+        return Capability.FOOTPRINT in self.capabilities
+
+
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Condition:
+    code: str
+    stage: Stage
+    label: str
+    fn: Callable[[EvaluationContext], Tuple[ConditionStatus, Reason, Dict]]
+
+    def evaluate(self, ctx: EvaluationContext) -> ConditionResult:
+        status, reason, detail = self.fn(ctx)
+        return ConditionResult(self.code, self.label, self.stage, status, reason, detail)
+
+
+def _ok(detail: Dict = None) -> Tuple:
+    return ConditionStatus.PASS, Reason.OK, detail or {}
+
+
+def _wait(reason: Reason, detail: Dict = None) -> Tuple:
+    return ConditionStatus.WAITING, reason, detail or {}
+
+
+def _fail(reason: Reason, detail: Dict = None) -> Tuple:
+    return ConditionStatus.FAILED, reason, detail or {}
+
+
+def _na(reason: Reason, detail: Dict = None) -> Tuple:
+    """The rule has no subject here - nothing to check."""
+    return ConditionStatus.NOT_APPLICABLE, reason, detail or {}
+
+
+def _unknown(reason: Reason, detail: Dict = None) -> Tuple:
+    """The rule applies, but the data to verify it is not available."""
+    return ConditionStatus.UNKNOWN, reason, detail or {}
+
+
+# ---------------------------------------------------------------------------
+# Stage 1 - ENVIRONMENT
+# ---------------------------------------------------------------------------
+
+def _e01(ctx: EvaluationContext):
+    s = ctx.structure
+    if s is Structure.UNDEFINED:
+        return _wait(Reason.STRUCTURE_UNDEFINED,
+                     {"source": "plan" if ctx.plan.htf_structure is not Structure.UNDEFINED else "derived"})
+    return _ok({"structure": s.value,
+                "source": "plan" if ctx.plan.htf_structure is not Structure.UNDEFINED else "derived"})
+
+
+def _e02(ctx: EvaluationContext):
+    if ctx.gex.regime is GammaRegime.UNKNOWN:
+        # The regime exists whether or not we can see it. Never guess it from
+        # price, and never record it as a pass.
+        return _unknown(Reason.NO_FEED_CONFIGURED,
+                        {"regime": GammaRegime.UNKNOWN.value,
+                         "note": "no GEX feed - condition not verified"})
+    return _ok({"regime": ctx.gex.regime.value, "source": ctx.gex.source})
+
+
+def _e03(ctx: EvaluationContext):
+    levels = {"call_wall": ctx.gex.call_wall or ctx.plan.call_wall,
+              "put_wall": ctx.gex.put_wall or ctx.plan.put_wall,
+              "gamma_flip": ctx.gex.gamma_flip or ctx.plan.gamma_flip}
+    if not any(v is not None for v in levels.values()):
+        return _na(Reason.NO_FEED_CONFIGURED, levels)
+    return _ok(levels)
+
+
+def _e04(ctx: EvaluationContext):
+    vp = ctx.volume_profile
+    if vp is None:
+        return _wait(Reason.REQUIRED_DATA_UNAVAILABLE, {})
+    return _ok({"vah": vp.vah, "val": vp.val, "poc": vp.poc,
+                "source": vp.source, "degraded": vp.source != "footprint"})
+
+
+def _e05(ctx: EvaluationContext):
+    if not ctx.plan.is_locked:
+        return _wait(Reason.PLAN_NOT_LOCKED, {"missing": ctx.plan.missing_fields()})
+    missing = ctx.plan.missing_fields()
+    if missing:
+        return _fail(Reason.PLAN_NOT_LOCKED, {"missing": missing})
+    return _ok({"locked_at": ctx.plan.locked_at.isoformat(),
+                "amendments": len(ctx.plan.amendments)})
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 - LOCATION
+# ---------------------------------------------------------------------------
+
+def _l01(ctx: EvaluationContext):
+    if ctx.direction is None:
+        return _wait(Reason.PLAN_NOT_LOCKED, {})
+    s = ctx.structure
+    if s is Structure.UNDEFINED:
+        return _wait(Reason.STRUCTURE_UNDEFINED, {})
+    aligned = (
+        (ctx.direction is Direction.LONG and s is Structure.VALUE_UP)
+        or (ctx.direction is Direction.SHORT and s is Structure.VALUE_DOWN)
+    )
+    if aligned:
+        return _ok({"structure": s.value, "direction": ctx.direction.value})
+    if ctx.plan.allow_countertrend:
+        return _ok({"structure": s.value, "direction": ctx.direction.value,
+                    "countertrend": True})
+    return _fail(Reason.DIRECTION_AGAINST_STRUCTURE,
+                 {"structure": s.value, "direction": ctx.direction.value})
+
+
+def _l02(ctx: EvaluationContext):
+    vp, price, d = ctx.volume_profile, ctx.price, ctx.direction
+    if vp is None or price is None or d is None:
+        return _wait(Reason.REQUIRED_DATA_UNAVAILABLE, {})
+    if d is Direction.LONG:
+        ok = price < vp.val
+        label = "discount"
+    else:
+        ok = price > vp.vah
+        label = "premium"
+    detail = {"price": price, "val": vp.val, "vah": vp.vah, "seeking": label}
+    return _ok(detail) if ok else _wait(Reason.PRICE_NOT_IN_ZONE, detail)
+
+
+def _l03(ctx: EvaluationContext):
+    if ctx.zone is None:
+        return _wait(Reason.NO_VALID_SWING, {})
+    return _ok({"levels": {str(k): round(v, 4) for k, v in ctx.zone.levels.items()},
+                "zone_low": ctx.zone.zone_low, "zone_high": ctx.zone.zone_high,
+                "invalidation_886": ctx.zone.invalidation})
+
+
+def _l04(ctx: EvaluationContext):
+    vp, z, d = ctx.volume_profile, ctx.zone, ctx.direction
+    if vp is None or z is None or d is None:
+        return _wait(Reason.REQUIRED_DATA_UNAVAILABLE, {})
+    outside = z.zone_high < vp.val if d is Direction.LONG else z.zone_low > vp.vah
+    detail = {"zone_low": z.zone_low, "zone_high": z.zone_high,
+              "val": vp.val, "vah": vp.vah}
+    return _ok(detail) if outside else _fail(Reason.ZONE_INSIDE_VALUE, detail)
+
+
+def _l05(ctx: EvaluationContext):
+    vp, z = ctx.volume_profile, ctx.zone
+    if vp is None or z is None:
+        return _wait(Reason.REQUIRED_DATA_UNAVAILABLE, {})
+    thresh = ctx.instrument.lvn_threshold_pct
+    lvn = an.is_low_volume_node(vp, z.zone_low, z.zone_high, thresh)
+    detail = {"zone_volume": vp.node_volume(z.zone_low, z.zone_high),
+              "poc_volume": vp.peak_volume(), "threshold_pct": thresh}
+    return _ok(detail) if lvn else _fail(Reason.NOT_LOW_VOLUME_NODE, detail)
+
+
+def _l06(ctx: EvaluationContext):
+    if ctx.leg is None:
+        return _wait(Reason.NO_VALID_SWING, {"swing_strength": ctx.instrument.swing_strength})
+    origin, extreme = ctx.leg
+    return _ok({"origin": {"index": origin.index, "price": origin.price, "kind": origin.kind},
+                "extreme": {"index": extreme.index, "price": extreme.price, "kind": extreme.kind},
+                "swing_strength": ctx.instrument.swing_strength})
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 - CONFIRMATION
+# ---------------------------------------------------------------------------
+
+def _needs_orderflow(ctx: EvaluationContext):
+    if not ctx.has_orderflow or not ctx.evidence.orderflow_available:
+        return _unknown(Reason.REQUIRED_DATA_UNAVAILABLE,
+                        {"required": [Capability.FOOTPRINT.value, Capability.DELTA.value],
+                         "available": sorted(c.value for c in ctx.capabilities)})
+    return None
+
+
+def _c01(ctx: EvaluationContext):
+    missing = _needs_orderflow(ctx)
+    if missing:
+        return missing
+    a = ctx.evidence.first_attempt
+    if a is None:
+        return _wait(Reason.NO_AGGRESSION_AT_EXTREME, {})
+    return _ok({"bar": a.index, "delta": a.delta, "extreme": a.extreme,
+                "concentration": round(a.concentration, 3)})
+
+
+def _c02(ctx: EvaluationContext):
+    missing = _needs_orderflow(ctx)
+    if missing:
+        return missing
+    if not ctx.evidence.absorption:
+        return _wait(Reason.NO_ABSORPTION, {})
+    return _ok({"note": "effort without result at the extreme"})
+
+
+def _c03(ctx: EvaluationContext):
+    missing = _needs_orderflow(ctx)
+    if missing:
+        return missing
+    idx = ctx.evidence.dominance_shift_index
+    if idx is None:
+        return _wait(Reason.NO_DOMINANCE_SHIFT, {})
+    return _ok({"bar": idx})
+
+
+def _c04(ctx: EvaluationContext):
+    missing = _needs_orderflow(ctx)
+    if missing:
+        return missing
+    ev = ctx.evidence
+    if ev.second_attempt is None:
+        return _wait(Reason.SECOND_ATTEMPT_NOT_OBSERVED,
+                     {"first_attempt_extreme": ev.first_attempt.extreme if ev.first_attempt else None})
+    if not ev.second_attempt_failed_better:
+        return _wait(Reason.SECOND_ATTEMPT_NOT_OBSERVED,
+                     {"second_attempt_extreme": ev.second_attempt.extreme,
+                      "first_attempt_extreme": ev.first_attempt.extreme if ev.first_attempt else None})
+    return _ok({"bar": ev.second_attempt.index,
+                "failed_at": ev.second_attempt.extreme,
+                "first_attempt_extreme": ev.first_attempt.extreme if ev.first_attempt else None})
+
+
+def _c05(ctx: EvaluationContext):
+    missing = _needs_orderflow(ctx)
+    if missing:
+        return missing
+    ev = ctx.evidence
+    if not ev.imbalance_ok:
+        return _wait(Reason.IMBALANCE_BELOW_THRESHOLD,
+                     {"found": len(ev.imbalances),
+                      "required": ctx.instrument.min_imbalance_levels,
+                      "ratio": ctx.instrument.imbalance_ratio})
+    return _ok({"levels": len(ev.imbalances),
+                "ratio": ctx.instrument.imbalance_ratio,
+                "prices": [i.price for i in ev.imbalances]})
+
+
+# ---------------------------------------------------------------------------
+# Stage 4 - RISK
+# ---------------------------------------------------------------------------
+
+def _r01(ctx: EvaluationContext):
+    if ctx.stop is None:
+        return _wait(Reason.NO_INVALIDATION_LEVEL, {})
+    return _ok({"stop": ctx.stop, "failure_level": ctx.evidence.failure_level,
+                "source": ctx.stop_source,
+                "buffer_ticks": ctx.instrument.stop_buffer_ticks})
+
+
+def _r02(ctx: EvaluationContext):
+    vp, d = ctx.volume_profile, ctx.direction
+    if vp is None or d is None:
+        return _wait(Reason.REQUIRED_DATA_UNAVAILABLE, {})
+    checkpoint = vp.val if d is Direction.LONG else vp.vah
+    return _ok({"reclaim_level": checkpoint,
+                "rule": "significant effort without reclaim -> MOVE_TO_BREAK_EVEN or EXIT"})
+
+
+def _r03(ctx: EvaluationContext):
+    if ctx.target is None:
+        return _fail(Reason.NO_TARGET_FOUND, {})
+    return _ok({"target": ctx.target, "kind": ctx.target_kind})
+
+
+def _r04(ctx: EvaluationContext):
+    if ctx.rr is None:
+        return _wait(Reason.REQUIRED_DATA_UNAVAILABLE, {})
+    minimum = ctx.instrument.minimum_rr
+    detail = {"rr": round(ctx.rr, 3), "minimum": minimum,
+              "entry": ctx.entry, "stop": ctx.stop, "target": ctx.target}
+    return _ok(detail) if ctx.rr >= minimum else _fail(Reason.RR_BELOW_MINIMUM, detail)
+
+
+def _r05(ctx: EvaluationContext):
+    if not ctx.plan.trail_plan:
+        return _fail(Reason.NO_TRAIL_PLAN, {})
+    return _ok({"trail_plan": ctx.plan.trail_plan})
+
+
+# ---------------------------------------------------------------------------
+
+CONDITIONS: Tuple[Condition, ...] = (
+    Condition("E01", Stage.ENVIRONMENT, "Higher-timeframe structure", _e01),
+    Condition("E02", Stage.ENVIRONMENT, "Gamma regime", _e02),
+    Condition("E03", Stage.ENVIRONMENT, "Gamma reference levels", _e03),
+    Condition("E04", Stage.ENVIRONMENT, "Volume profile (VAH/VAL/POC)", _e04),
+    Condition("E05", Stage.ENVIRONMENT, "Pre-market plan locked", _e05),
+    Condition("L01", Stage.LOCATION, "Structure alignment", _l01),
+    Condition("L02", Stage.LOCATION, "Discount / premium", _l02),
+    Condition("L03", Stage.LOCATION, "Fibonacci zone 0.705/0.788/0.886", _l03),
+    Condition("L04", Stage.LOCATION, "Zone outside value area", _l04),
+    Condition("L05", Stage.LOCATION, "Low-volume / inefficient area", _l05),
+    Condition("L06", Stage.LOCATION, "Fib drawn from a real swing", _l06),
+    Condition("C01", Stage.CONFIRMATION, "Aggressive delta at the extreme", _c01),
+    Condition("C02", Stage.CONFIRMATION, "Effort without result (absorption)", _c02),
+    Condition("C03", Stage.CONFIRMATION, "Dominance shift", _c03),
+    Condition("C04", Stage.CONFIRMATION, "Second attempt fails", _c04),
+    Condition("C05", Stage.CONFIRMATION, "Footprint imbalance", _c05),
+    Condition("R01", Stage.RISK, "Stop beyond the failure", _r01),
+    Condition("R02", Stage.RISK, "Value reclaim checkpoint", _r02),
+    Condition("R03", Stage.RISK, "Target", _r03),
+    Condition("R04", Stage.RISK, "Minimum reward:risk", _r04),
+    Condition("R05", Stage.RISK, "Trail plan recorded", _r05),
+)
+
+
+def conditions_for(stage: Stage) -> Sequence[Condition]:
+    return tuple(c for c in CONDITIONS if c.stage is stage)
+
+
+def derive_structure(bars: Sequence[Bar], strength: int = 2,
+                     tick_size: float = 0.25, chunks: int = 3,
+                     min_shift_pct: float = 0.0008) -> Structure:
+    """Classify structure by *value migration*, not by 5-minute fractals.
+
+    The question the method actually asks is "where is value being created,
+    and is it being created higher each time" - so the primary test compares
+    the POC of successive chunks of the context window. Fractal higher
+    highs / higher lows are the fallback when there is not enough volume data
+    to build profiles.
+    """
+    if len(bars) >= chunks * 3:
+        size = len(bars) // chunks
+        pocs = []
+        for i in range(chunks):
+            slice_ = bars[i * size: (i + 1) * size] if i < chunks - 1 else bars[i * size:]
+            vp = an.build_volume_profile(slice_, tick_size)
+            if vp is None:
+                pocs = []
+                break
+            pocs.append(vp.poc)
+        if len(pocs) == chunks:
+            reference = pocs[0] or 1.0
+            shift = (pocs[-1] - pocs[0]) / abs(reference)
+            rising = all(b > a for a, b in zip(pocs, pocs[1:]))
+            falling = all(b < a for a, b in zip(pocs, pocs[1:]))
+            if rising and shift >= min_shift_pct:
+                return Structure.VALUE_UP
+            if falling and -shift >= min_shift_pct:
+                return Structure.VALUE_DOWN
+            if abs(shift) < min_shift_pct:
+                return Structure.SIDEWAYS
+
+    swings = an.find_swings(bars, strength)
+    highs = [s for s in swings if s.kind == "high"][-2:]
+    lows = [s for s in swings if s.kind == "low"][-2:]
+    if len(highs) < 2 or len(lows) < 2:
+        return Structure.UNDEFINED
+    if highs[-1].price > highs[-2].price and lows[-1].price > lows[-2].price:
+        return Structure.VALUE_UP
+    if highs[-1].price < highs[-2].price and lows[-1].price < lows[-2].price:
+        return Structure.VALUE_DOWN
+    return Structure.SIDEWAYS
+
+============================================================
+FILE: tradinggate\halts.py
+============================================================
+"""Hard halts (H01-H06).
+
+A halt overrides everything. No combination of passing conditions can arm the
+gate while one is active.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+from .conditions import EvaluationContext
+from .enums import GateState, Reason
+from .session import SessionState
+
+NEWS_WINDOW_MINUTES = 10
+BLOCKING_NEWS_IMPACT = {"HIGH"}
+
+
+@dataclass
+class Halt:
+    code: str
+    label: str
+    reason: Reason
+    detail: Dict = field(default_factory=dict)
+    invalidates_setup: bool = False   # H03 kills the idea rather than pausing it
+    locks_session: bool = False       # H02/H05/H06 end the day
+
+    def to_dict(self) -> Dict:
+        return {
+            "code": self.code,
+            "label": self.label,
+            "reason": self.reason.value,
+            "detail": self.detail,
+            "invalidates_setup": self.invalidates_setup,
+            "locks_session": self.locks_session,
+        }
+
+
+def evaluate_halts(ctx: EvaluationContext, session: SessionState) -> List[Halt]:
+    halts: List[Halt] = []
+    profile = ctx.instrument
+
+    # H01 - participation ---------------------------------------------------
+    last = ctx.last
+    if profile.minimum_volume is None:
+        halts_detail = {"instrument": profile.symbol,
+                        "note": "no participation floor calibrated for this instrument"}
+        halts.append(Halt("H01", "Participation floor not calibrated",
+                          Reason.THRESHOLD_NOT_CALIBRATED, halts_detail))
+    elif last is not None and last.volume < profile.minimum_volume:
+        halts.append(Halt("H01", "Participation too low", Reason.PARTICIPATION_TOO_LOW,
+                          {"volume": last.volume, "minimum": profile.minimum_volume,
+                           "timeframe": profile.confirmation_timeframe,
+                           "instrument": profile.symbol}))
+
+    # H02 - session time limit ---------------------------------------------
+    if session.past_cutoff:
+        halts.append(Halt("H02", "Session time limit reached", Reason.SESSION_TIME_LIMIT,
+                          {"minutes_since_open": round(session.minutes_since_open or 0, 1),
+                           "limit_minutes": session.limit_minutes},
+                          locks_session=True))
+
+    # H03 - 0.886 invalidation ---------------------------------------------
+    if ctx.evidence.invalidated:
+        halts.append(Halt("H03", "Setup invalidated at the 0.886", Reason.INVALIDATION_886,
+                          {"level": ctx.zone.invalidation if ctx.zone else None,
+                           "notes": ctx.evidence.notes[-3:]},
+                          invalidates_setup=True))
+
+    # H04 - news -------------------------------------------------------------
+    if ctx.news is None:
+        pass  # no calendar connected; the engine will not invent one
+    else:
+        blocking = [e for e in ctx.news if e.impact.upper() in BLOCKING_NEWS_IMPACT]
+        if blocking:
+            halts.append(Halt("H04", "High-impact news too close", Reason.NEWS_TOO_CLOSE,
+                              {"events": [{"title": e.title, "ts": e.ts.isoformat(),
+                                           "impact": e.impact} for e in blocking],
+                               "window_minutes": NEWS_WINDOW_MINUTES}))
+
+    # H05 - consecutive losses ----------------------------------------------
+    limit = session.max_consecutive_losses
+    if limit and session.consecutive_losses >= limit:
+        halts.append(Halt("H05", "Consecutive loss limit", Reason.CONSECUTIVE_LOSSES,
+                          {"consecutive_losses": session.consecutive_losses,
+                           "limit": limit,
+                           "note": "consecutive, not cumulative, losses"},
+                          locks_session=True))
+
+    # H06 - serious rule violation ------------------------------------------
+    serious = session.serious_violations
+    if serious:
+        halts.append(Halt("H06", "Serious rule violation", Reason.SERIOUS_RULE_VIOLATION,
+                          {"violations": [{"kind": v.kind.value, "note": v.note,
+                                           "ts": v.ts.isoformat()} for v in serious]},
+                          locks_session=True))
+    elif session.locked and session.lock_reason:
+        halts.append(Halt("H06", "Session locked", Reason.SERIOUS_RULE_VIOLATION,
+                          {"reason": session.lock_reason}, locks_session=True))
+
+    return halts
+
+
+def halt_state(halts: List[Halt]) -> Optional[GateState]:
+    if not halts:
+        return None
+    if any(h.invalidates_setup for h in halts):
+        return GateState.INVALIDATED
+    return GateState.HALTED
+
+============================================================
+FILE: tradinggate\strategies.py
+============================================================
+"""Strategy templates.
+
+The gate is generic. A strategy declares which conditions apply to it and
+supplies its own thresholds; the engine, session model, behaviour firewall and
+event log are shared. Template #1 is the auction/absorption methodology the
+engine was first built around.
+
+    TRADER -> STRATEGY -> {ENVIRONMENT, LOCATION, CONFIRMATION, RISK, BEHAVIOUR}
+           -> GATE
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Sequence, Tuple
+
+from .conditions import CONDITIONS, Condition
+from .confirmation import ConfirmationConfig
+from .enums import ConditionStatus, Stage
+
+CONDITION_REGISTRY: Dict[str, Condition] = {c.code: c for c in CONDITIONS}
+
+
+def register_condition(condition: Condition) -> None:
+    """Add a condition so a new strategy template can reference it by code."""
+    CONDITION_REGISTRY[condition.code] = condition
+
+
+@dataclass(frozen=True)
+class ConditionPolicy:
+    """How a strategy treats one condition.
+
+    required             False = advisory only; it is reported but never blocks
+    unknown_blocks_gate  True  = an unverifiable condition stops the gate arming
+    """
+
+    required: bool = True
+    unknown_blocks_gate: bool = True
+
+
+DEFAULT_POLICY = ConditionPolicy()
+
+#: Template #1 treats gamma as context, not as a gate. It is reported honestly
+#: as UNKNOWN when no feed is connected, and the trade may still arm - but the
+#: audit trail records that the condition was never verified.
+GAMMA_ADVISORY = {
+    "E02": ConditionPolicy(required=False, unknown_blocks_gate=False),
+    "E03": ConditionPolicy(required=False, unknown_blocks_gate=False),
+}
+
+
+def satisfies(status: ConditionStatus, policy: ConditionPolicy) -> bool:
+    if not policy.required:
+        return True
+    if status is ConditionStatus.PASS:
+        return True
+    if status is ConditionStatus.NOT_APPLICABLE:
+        return True
+    if status is ConditionStatus.UNKNOWN:
+        return not policy.unknown_blocks_gate
+    return False
+
+
+@dataclass(frozen=True)
+class StrategyTemplate:
+    key: str
+    name: str
+    description: str
+    condition_codes: Tuple[str, ...]
+    confirmation: ConfirmationConfig = field(default_factory=ConfirmationConfig)
+    allow_countertrend: bool = False
+    policies: Dict[str, ConditionPolicy] = field(default_factory=dict)
+
+    def policy_for(self, code: str) -> ConditionPolicy:
+        return self.policies.get(code, DEFAULT_POLICY)
+
+    def has(self, code: str) -> bool:
+        return code in self.condition_codes
+
+    def variant(self, key: str, *, drop: Sequence[str] = (),
+                policies: Optional[Dict[str, ConditionPolicy]] = None,
+                name: Optional[str] = None) -> "StrategyTemplate":
+        """A copy with conditions removed or policies changed.
+
+        Used by the ablation study: each variant is re-run through the whole
+        engine rather than filtered out of a fixed trade list, because dropping
+        a condition changes entry timing, stop placement and therefore R.
+        """
+        merged = dict(self.policies)
+        merged.update(policies or {})
+        return StrategyTemplate(
+            key=key,
+            name=name or f"{self.name} [{key}]",
+            description=self.description,
+            condition_codes=tuple(c for c in self.condition_codes if c not in set(drop)),
+            confirmation=self.confirmation,
+            allow_countertrend=self.allow_countertrend,
+            policies=merged,
+        )
+
+    def conditions(self) -> Tuple[Condition, ...]:
+        missing = [c for c in self.condition_codes if c not in CONDITION_REGISTRY]
+        if missing:
+            raise KeyError(f"Strategy {self.key!r} references unknown conditions: {missing}")
+        return tuple(CONDITION_REGISTRY[c] for c in self.condition_codes)
+
+    def conditions_for(self, stage: Stage) -> Tuple[Condition, ...]:
+        return tuple(c for c in self.conditions() if c.stage is stage)
+
+
+AUCTION_ABSORPTION_V1 = StrategyTemplate(
+    key="auction_absorption_v1",
+    name="Auction / absorption reversal (Template #1)",
+    description=(
+        "Higher-timeframe value migration sets direction; trades are taken only "
+        "in discount/premium outside the value area, at a fib zone drawn from a "
+        "real swing, and only after the opposing side has failed twice with "
+        "order-flow evidence."
+    ),
+    condition_codes=(
+        "E01", "E02", "E03", "E04", "E05",
+        "L01", "L02", "L03", "L04", "L05", "L06",
+        "C01", "C02", "C03", "C04", "C05",
+        "R01", "R02", "R03", "R04", "R05",
+    ),
+    confirmation=ConfirmationConfig(),
+    policies=dict(GAMMA_ADVISORY),
+)
+
+STRATEGY_REGISTRY: Dict[str, StrategyTemplate] = {
+    AUCTION_ABSORPTION_V1.key: AUCTION_ABSORPTION_V1,
+}
+
+
+def register_strategy(template: StrategyTemplate) -> None:
+    STRATEGY_REGISTRY[template.key] = template
+
+
+def get_strategy(key: str) -> StrategyTemplate:
+    try:
+        return STRATEGY_REGISTRY[key]
+    except KeyError as exc:
+        raise KeyError(
+            f"Unknown strategy {key!r}. Registered: {sorted(STRATEGY_REGISTRY)}"
+        ) from exc
+
+
+# Example of reuse: an opening-range template would register its own C-stage
+# conditions and reference the shared environment and risk ones.
+#
+#   register_condition(Condition("C10", Stage.CONFIRMATION, "Range break holds", fn))
+#   register_strategy(StrategyTemplate(
+#       key="orb_v1", name="Opening range breakout", description="...",
+#       condition_codes=("E01","E04","E05","L06","C10","R01","R03","R04","R05")))
+
+============================================================
+FILE: tradinggate\simulator.py
+============================================================
+"""Forward simulation of an armed trade.
+
+Assumptions are stated rather than buried, because they move the results:
+
+  * **Stop before target.** When one bar's range covers both levels, the stop
+    is taken. Without tick data the true sequence is unknowable; the
+    pessimistic choice is the only defensible one.
+  * **Fills at the level.** No slippage or commission by default. Both are
+    configurable and both matter at 1.5R - set them before believing any
+    expectancy number.
+  * **Entry at the confirming bar's close**, matching how the gate arms.
+  * **R02 checkpoint.** If price has not reclaimed the value-area edge within
+    `checkpoint_bars`, the stop moves to break even. This is the engine's own
+    management rule, applied mechanically.
+  * **Session cutoff.** Open trades are closed at the close of the bar that
+    crosses the session limit.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import List, Optional, Sequence
+
+from .enums import Direction
+from .marketdata import Bar
+
+
+@dataclass(frozen=True)
+class FillModel:
+    slippage_ticks: float = 0.0
+    commission_r: float = 0.0        # round-trip cost expressed in R
+    stop_before_target: bool = True
+
+
+@dataclass
+class SimResult:
+    exit_price: float
+    exited_at: datetime
+    r_result: float
+    mae_r: float
+    mfe_r: float
+    exit_reason: str                 # STOP | TARGET | BREAK_EVEN | TIME | EOD
+    bars_held: int
+    moved_to_break_even: bool = False
+
+
+def simulate(
+    bars: Sequence[Bar],
+    entry_index: int,
+    direction: Direction,
+    entry: float,
+    stop: float,
+    target: Optional[float],
+    tick_size: float,
+    reclaim_level: Optional[float] = None,
+    checkpoint_bars: int = 3,
+    session_end: Optional[datetime] = None,
+    fills: Optional[FillModel] = None,
+) -> Optional[SimResult]:
+    """Walk forward from the bar after entry until the trade resolves."""
+    fills = fills or FillModel()
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return None
+
+    long = direction is Direction.LONG
+    slip = fills.slippage_ticks * tick_size
+    active_stop = stop
+    moved_be = False
+    mae = mfe = 0.0
+    reclaimed = False
+
+    def r_of(price: float) -> float:
+        move = (price - entry) if long else (entry - price)
+        return move / risk - fills.commission_r
+
+    for offset, bar in enumerate(bars[entry_index + 1:], start=1):
+        fav = (bar.high - entry) if long else (entry - bar.low)
+        adv = (entry - bar.low) if long else (bar.high - entry)
+        mfe = max(mfe, fav / risk)
+        mae = max(mae, adv / risk)
+
+        hit_stop = bar.low <= active_stop if long else bar.high >= active_stop
+        hit_target = target is not None and (
+            bar.high >= target if long else bar.low <= target)
+
+        if hit_stop and (fills.stop_before_target or not hit_target):
+            price = active_stop - slip if long else active_stop + slip
+            reason = "BREAK_EVEN" if moved_be else "STOP"
+            return SimResult(price, bar.ts, r_of(price), mae, mfe, reason,
+                             offset, moved_be)
+        if hit_target:
+            price = target - slip if long else target + slip
+            return SimResult(price, bar.ts, r_of(price), mae, mfe, "TARGET",
+                             offset, moved_be)
+
+        if reclaim_level is not None and not reclaimed:
+            reclaimed = bar.close > reclaim_level if long else bar.close < reclaim_level
+            if not reclaimed and offset >= checkpoint_bars and not moved_be:
+                active_stop = entry
+                moved_be = True
+
+        if session_end is not None and bar.ts >= session_end:
+            return SimResult(bar.close, bar.ts, r_of(bar.close), mae, mfe,
+                             "TIME", offset, moved_be)
+
+    if len(bars) <= entry_index + 1:
+        return None
+    last = bars[-1]
+    return SimResult(last.close, last.ts, r_of(last.close), mae, mfe, "EOD",
+                     len(bars) - entry_index - 1, moved_be)
+
+============================================================
+FILE: tradinggate\replay_builder.py
+============================================================
+"""Synthetic replay data with real footprint structure.
+
+Deterministic: no randomness, no market data redistributed from a vendor. The
+scenario is constructed so the whole gate can be exercised end to end, and so
+that a single edit (drop a bar, thin the volume) demonstrably prevents arming.
+"""
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+from .marketdata import Bar, PriceLevel
+
+TICK = 0.25
+
+
+def _grid(low: float, high: float, tick: float = TICK) -> List[float]:
+    low, high = min(low, high), max(low, high)
+    n = max(int(round((high - low) / tick)), 0)
+    return [round(low + i * tick, 4) for i in range(n + 1)]
+
+
+def build_ladder(
+    low: float,
+    high: float,
+    volume: int,
+    delta_ratio: float = 0.0,
+    concentrate: Optional[Tuple[float, float, float]] = None,
+    imbalance_top: int = 0,
+    tick: float = TICK,
+) -> List[PriceLevel]:
+    """Distribute `volume` across the bar's price grid.
+
+    delta_ratio   signed share of volume that ends up as delta
+                  (+0.2 => aggressive buyers, -0.2 => aggressive sellers)
+    concentrate   (band_low, band_high, share) forces `share` of the bar's
+                  volume into that price band - the wick where the effort went
+    imbalance_top number of top price levels given a heavy ask / thin bid pair,
+                  producing diagonal ask imbalances
+    """
+    prices = _grid(low, high, tick)
+    n = len(prices)
+    if n == 0:
+        return []
+    weights = [1.0] * n
+    if concentrate:
+        band_lo, band_hi, share = concentrate
+        band_lo, band_hi = min(band_lo, band_hi), max(band_lo, band_hi)
+        idx = [i for i, p in enumerate(prices) if band_lo <= p <= band_hi] or [0]
+        rest = [i for i in range(n) if i not in set(idx)]
+        for i in idx:
+            weights[i] = (share / len(idx)) * 100
+        for i in rest:
+            weights[i] = ((1 - share) / max(len(rest), 1)) * 100
+
+    total_w = sum(weights) or 1.0
+    levels: List[PriceLevel] = []
+    for i, price in enumerate(prices):
+        vol = max(int(volume * weights[i] / total_w), 1)
+        ask = int(vol * (1 + delta_ratio) / 2)
+        bid = vol - ask
+        levels.append(PriceLevel(price, bid_volume=bid, ask_volume=ask))
+
+    for k in range(imbalance_top):
+        i = n - 1 - k
+        if i <= 0:
+            break
+        upper = levels[i]
+        lower = levels[i - 1]
+        levels[i] = PriceLevel(upper.price, bid_volume=max(upper.bid_volume // 6, 1),
+                               ask_volume=max(upper.ask_volume * 3, 900))
+        levels[i - 1] = PriceLevel(lower.price,
+                                   bid_volume=max(lower.bid_volume // 8, 1),
+                                   ask_volume=lower.ask_volume)
+    return levels
+
+
+def make_bar(ts: datetime, o: float, h: float, l: float, c: float, volume: int,
+             delta_ratio: float = 0.0,
+             concentrate: Optional[Tuple[float, float, float]] = None,
+             concentrate_extreme: Optional[Tuple[str, float, float]] = None,
+             imbalance_top: int = 0,
+             orderflow: bool = True) -> Bar:
+    """concentrate_extreme=(side, pct_of_range, share) puts `share` of the
+    bar's volume into the lowest/highest `pct_of_range` of its own range -
+    scale-independent, unlike an absolute price band."""
+    if concentrate_extreme is not None:
+        side, pct, share = concentrate_extreme
+        lo, hi = min(l, h), max(l, h)
+        span = max(hi - lo, TICK)
+        concentrate = ((lo, lo + span * pct, share) if side == "low"
+                       else (hi - span * pct, hi, share))
+    ladder = build_ladder(l, h, volume, delta_ratio, concentrate,
+                          imbalance_top) if orderflow else None
+    if ladder:
+        volume = sum(x.volume for x in ladder)
+    return Bar(ts=ts, open=o, high=h, low=l, close=c, volume=volume, ladder=ladder)
+
+
+# ---------------------------------------------------------------------------
+# Scenario: MNQ long from discount after a double seller failure
+# ---------------------------------------------------------------------------
+
+SESSION_OPEN_BAR = 14   # NY open; bars before this are overnight context
+CONFIRMING_BAR = 22     # the bar on which the last condition (C05) completes
+
+
+def mnq_long_scenario(start: Optional[datetime] = None,
+                      orderflow: bool = True) -> List[Bar]:
+    t = start or datetime(2026, 8, 14, 11, 30, tzinfo=timezone.utc)
+    step = timedelta(minutes=5)
+    bars: List[Bar] = []
+
+    def add(o, h, l, c, vol, **kw):
+        nonlocal t
+        bars.append(make_bar(t, o, h, l, c, vol, orderflow=orderflow, **kw))
+        t = t + step
+
+    # --- overnight base: the origin of the impulse (low volume) -----------
+    add(19908, 19916, 19904, 19912, 3800)
+    add(19912, 19922, 19908, 19918, 4000)
+    add(19910, 19920, 19902, 19915, 4000)
+    add(19915, 19918, 19900, 19906, 4200)     # swing low 19900
+    add(19906, 19930, 19904, 19928, 4600, delta_ratio=0.10)
+    add(19928, 19946, 19924, 19944, 5200, delta_ratio=0.12)
+
+    # --- impulse up: fast, thin, leaves an inefficient pocket -------------
+    add(19944, 20000, 19942, 19996, 6000, delta_ratio=0.20)
+    add(19996, 20060, 19994, 20056, 6400, delta_ratio=0.22)
+    add(20056, 20098, 20052, 20092, 7000, delta_ratio=0.18)
+
+    # --- balance at the highs: this is where value gets built -------------
+    for o, h, l, c in (
+        (20092, 20100, 20068, 20080),
+        (20080, 20096, 20066, 20090),
+        (20090, 20102, 20070, 20074),   # swing high 20102
+        (20074, 20094, 20064, 20086),
+        (20086, 20092, 20062, 20070),
+        (20070, 20088, 20060, 20078),
+        (20078, 20090, 20066, 20072),
+        (20072, 20084, 20058, 20062),
+    ):
+        add(o, h, l, c, 42000, concentrate=(20070, 20086, 0.55))
+
+    # --- NY open: value fails, price walks down into discount -------------
+    add(20062, 20066, 20010, 20016, 34000, delta_ratio=-0.22)
+    add(20016, 20020, 19972, 19978, 31000, delta_ratio=-0.24)
+
+    # A: first attempt - heavy aggressive selling stacked at the low,
+    #    no downside result, closes back in the upper half of the bar
+    add(19978, 19984, 19950, 19974, 30000, delta_ratio=-0.26,
+        concentrate=(19950, 19960, 0.46))
+
+    # B: dominance shifts back - bullish close on positive delta
+    add(19974, 19992, 19970, 19990, 27000, delta_ratio=0.20)
+
+    # C: second attempt - sellers try again and fail HIGHER than 19950
+    add(19990, 19994, 19958, 19986, 28000, delta_ratio=-0.20,
+        concentrate=(19958, 19968, 0.44))
+
+    # D: buyers lift the offer - ask-side imbalances light up
+    add(19986, 20006, 19982, 20004, 26000, delta_ratio=0.30, imbalance_top=4)
+
+    # follow-through toward the value area
+    add(20004, 20032, 20000, 20028, 25000, delta_ratio=0.26)
+    add(20028, 20062, 20024, 20058, 24000, delta_ratio=0.22)
+    return bars
+
+
+def thin_participation_tail(bars: Sequence[Bar], index: int = -1) -> List[Bar]:
+    """Same scenario, but one bar has too few contracts to trade against.
+
+    Defaults to the last bar; pass CONFIRMING_BAR to starve the bar on which
+    the gate would otherwise arm.
+    """
+    out = list(bars)
+    b = out[index]
+    out[index] = Bar(b.ts, b.open, b.high, b.low, b.close, volume=8000,
+                     ladder=b.ladder)
+    return out
+
+
+def write_jsonl(bars: Sequence[Bar], path: Path | str) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        for bar in bars:
+            fh.write(json.dumps(bar.to_dict()) + "\n")
+    return path
+
+
+def session_open_time(bars: Sequence[Bar]) -> datetime:
+    return bars[SESSION_OPEN_BAR].ts
+
+============================================================
+FILE: tradinggate\enums.py
+============================================================
+"""Enumerations shared across the engine.
+
+Everything here is a plain string enum so that values serialise straight into
+JSON for the SaaS API contract without a translation layer.
+"""
+from __future__ import annotations
+
+from enum import Enum
+
+
+class ConditionStatus(str, Enum):
+    """Five states, and the distinction between the last two matters.
+
+    UNKNOWN        the rule applies but we could not verify it (no feed)
+    NOT_APPLICABLE the rule has no subject in this setup at all
+
+    Conflating them destroys the audit trail: later you need to know whether
+    a condition was checked and passed, or was never checked.
+    """
+
+    PASS = "PASS"
+    WAITING = "WAITING"
+    FAILED = "FAILED"
+    UNKNOWN = "UNKNOWN"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+
+
+class GateState(str, Enum):
+    LOCKED = "LOCKED"
+    WAITING = "WAITING"
+    ARMED = "ARMED"
+    HALTED = "HALTED"
+    INVALIDATED = "INVALIDATED"
+
+
+class StageStatus(str, Enum):
+    PASS = "PASS"
+    WAITING = "WAITING"
+    FAILED = "FAILED"
+    LOCKED = "LOCKED"
+
+
+class Stage(str, Enum):
+    ENVIRONMENT = "ENVIRONMENT"
+    LOCATION = "LOCATION"
+    CONFIRMATION = "CONFIRMATION"
+    RISK = "RISK"
+
+
+STAGE_ORDER = (Stage.ENVIRONMENT, Stage.LOCATION, Stage.CONFIRMATION, Stage.RISK)
+
+
+class Structure(str, Enum):
+    VALUE_UP = "VALUE_UP"
+    VALUE_DOWN = "VALUE_DOWN"
+    SIDEWAYS = "SIDEWAYS"
+    UNDEFINED = "UNDEFINED"
+
+
+class GammaRegime(str, Enum):
+    POSITIVE_GAMMA = "POSITIVE_GAMMA"
+    NEGATIVE_GAMMA = "NEGATIVE_GAMMA"
+    NEUTRAL = "NEUTRAL"
+    UNKNOWN = "UNKNOWN"
+
+
+class Direction(str, Enum):
+    LONG = "LONG"
+    SHORT = "SHORT"
+
+    @property
+    def opposite(self) -> "Direction":
+        return Direction.SHORT if self is Direction.LONG else Direction.LONG
+
+
+class TradingMode(str, Enum):
+    REPLAY = "REPLAY"
+    PAPER = "PAPER"
+    LIVE = "LIVE"
+
+
+class ManagementAction(str, Enum):
+    HOLD = "HOLD"
+    REDUCE = "REDUCE"
+    MOVE_TO_BREAK_EVEN = "MOVE_TO_BREAK_EVEN"
+    EXIT = "EXIT"
+
+
+class Classification(str, Enum):
+    GOOD_TRADE = "GOOD_TRADE"
+    GOOD_LOSS = "GOOD_LOSS"
+    BAD_TRADE_GOOD_OUTCOME = "BAD_TRADE / GOOD_OUTCOME"
+    BAD_TRADE = "BAD_TRADE"
+
+
+class ViolationKind(str, Enum):
+    """Behavioural violations. `serious` ones can lock the session (H06)."""
+
+    PREMATURE_ENTRY = "PREMATURE_ENTRY"
+    CHASED_ENTRY = "CHASED_ENTRY"
+    BYPASSED_CONFIRMATION = "BYPASSED_CONFIRMATION"
+    SIZE_OUTSIDE_PLAN = "SIZE_OUTSIDE_PLAN"
+    STOP_MOVED_IMPROPERLY = "STOP_MOVED_IMPROPERLY"
+    PROHIBITED_SETUP = "PROHIBITED_SETUP"
+    PLAN_EDITED_AFTER_LOCK = "PLAN_EDITED_AFTER_LOCK"
+    TRADED_OUTSIDE_WINDOW = "TRADED_OUTSIDE_WINDOW"
+    HESITATED = "HESITATED"
+    ENTRY_DELAY = "ENTRY_DELAY"
+
+
+SERIOUS_VIOLATIONS = frozenset(
+    {
+        ViolationKind.PREMATURE_ENTRY,
+        ViolationKind.CHASED_ENTRY,
+        ViolationKind.BYPASSED_CONFIRMATION,
+        ViolationKind.SIZE_OUTSIDE_PLAN,
+        ViolationKind.STOP_MOVED_IMPROPERLY,
+        ViolationKind.PROHIBITED_SETUP,
+    }
+)
+
+
+class Reason(str, Enum):
+    """Machine-readable reason codes attached to condition results."""
+
+    OK = "OK"
+    REQUIRED_DATA_UNAVAILABLE = "REQUIRED_DATA_UNAVAILABLE"
+    THRESHOLD_NOT_CALIBRATED = "THRESHOLD_NOT_CALIBRATED"
+    NO_FEED_CONFIGURED = "NO_FEED_CONFIGURED"
+    PLAN_NOT_LOCKED = "PLAN_NOT_LOCKED"
+    STRUCTURE_UNDEFINED = "STRUCTURE_UNDEFINED"
+    DIRECTION_AGAINST_STRUCTURE = "DIRECTION_AGAINST_STRUCTURE"
+    PRICE_NOT_IN_ZONE = "PRICE_NOT_IN_ZONE"
+    ZONE_INSIDE_VALUE = "ZONE_INSIDE_VALUE"
+    NOT_LOW_VOLUME_NODE = "NOT_LOW_VOLUME_NODE"
+    NO_VALID_SWING = "NO_VALID_SWING"
+    NO_AGGRESSION_AT_EXTREME = "NO_AGGRESSION_AT_EXTREME"
+    NO_ABSORPTION = "NO_ABSORPTION"
+    NO_DOMINANCE_SHIFT = "NO_DOMINANCE_SHIFT"
+    SECOND_ATTEMPT_NOT_OBSERVED = "SECOND_ATTEMPT_NOT_OBSERVED"
+    IMBALANCE_BELOW_THRESHOLD = "IMBALANCE_BELOW_THRESHOLD"
+    NO_INVALIDATION_LEVEL = "NO_INVALIDATION_LEVEL"
+    NO_TARGET_FOUND = "NO_TARGET_FOUND"
+    RR_BELOW_MINIMUM = "RR_BELOW_MINIMUM"
+    NO_TRAIL_PLAN = "NO_TRAIL_PLAN"
+    NOT_VERIFIED = "NOT_VERIFIED"
+    STAGE_LOCKED = "STAGE_LOCKED"
+    PARTICIPATION_TOO_LOW = "PARTICIPATION_TOO_LOW"
+    SESSION_TIME_LIMIT = "SESSION_TIME_LIMIT"
+    INVALIDATION_886 = "INVALIDATION_886"
+    NEWS_TOO_CLOSE = "NEWS_TOO_CLOSE"
+    CONSECUTIVE_LOSSES = "CONSECUTIVE_LOSSES"
+    SERIOUS_RULE_VIOLATION = "SERIOUS_RULE_VIOLATION"
+
+
+class Capability(str, Enum):
+    """What a market-data provider can actually supply."""
+
+    OHLCV = "OHLCV"
+    TICKS = "TICKS"
+    BID_ASK = "BID_ASK"
+    VOLUME_AT_PRICE = "VOLUME_AT_PRICE"
+    DELTA = "DELTA"
+    FOOTPRINT = "FOOTPRINT"
+    VOLUME_PROFILE = "VOLUME_PROFILE"
+    OPTIONS_GEX = "OPTIONS_GEX"
+
+============================================================
+FILE: tradinggate\__init__.py
+============================================================
+"""trading-gate: a discipline and execution-control engine.
+
+The strategy is not the product - the gate is.
+"""
+from .analytics import FibZone, VolumeProfile, build_volume_profile, fib_zone
+from .api import explain, gate_payload, minimal_payload
+from .ablation import format_ablation, override_impact, run_ablation, unverified_impact
+from .backtest import (
+    BacktestReport,
+    HistoricalSession,
+    format_report,
+    run_corpus,
+    run_session,
+    synthesise_plan,
+)
+from .behaviour import analyse
+from .conditions import CONDITIONS, ConditionResult, EvaluationContext
+from .config import Settings
+from .confirmation import ConfirmationConfig, ConfirmationTracker
+from .enums import (
+    Classification,
+    ConditionStatus,
+    Direction,
+    GammaRegime,
+    GateState,
+    ManagementAction,
+    Stage,
+    StageStatus,
+    Structure,
+    TradingMode,
+    ViolationKind,
+)
+from .events import EventLogger
+from .gate import GateEngine, GateSnapshot
+from .grading import grade_trade
+from .instruments import INSTRUMENT_PROFILES, InstrumentProfile, get_profile
+from .loaders import audit, load_sessions
+from .marketdata import (
+    Bar,
+    GexSnapshot,
+    NewsEvent,
+    PriceLevel,
+    ReplayProvider,
+    StaticNewsProvider,
+    StaticOptionsProvider,
+    StrippedProvider,
+)
+from .persistence import JsonStore
+from .plan import PreMarketPlan
+from .render import render
+from .session import SessionState, TradeRecord
+from .simulator import FillModel, simulate
+from .strategies import (
+    AUCTION_ABSORPTION_V1,
+    ConditionPolicy,
+    StrategyTemplate,
+    get_strategy,
+)
+
+__version__ = "0.1.0"
